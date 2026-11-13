@@ -41,38 +41,52 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           node -e '
-          const token = (process.env.CLOUDFLARE_API_TOKEN || "").trim();
-          const accountId = (process.env.CLOUDFLARE_ACCOUNT_ID || "").trim();
+          const clean = (s) => String(s || "").trim().replace(/^["\x27]|["\x27]$/g, "");
+          const token = clean(process.env.CLOUDFLARE_API_TOKEN);
+          const accountId = clean(process.env.CLOUDFLARE_ACCOUNT_ID);
           if (!token) {
-            console.error("::error::Missing GitHub Secret: CLOUDFLARE_API_TOKEN. Create an API Token with Workers Scripts:Edit and Account Settings:Read permissions.");
+            console.error("::error::Missing GitHub Secret: CLOUDFLARE_API_TOKEN.");
             process.exit(1);
           }
           if (!accountId || !/^[a-f0-9]{32}$/i.test(accountId)) {
-            console.error("::error::Missing or invalid GitHub Secret: CLOUDFLARE_ACCOUNT_ID (expected 32-character hex Account ID from Cloudflare Dashboard).");
+            console.error("::error::Missing or invalid GitHub Secret: CLOUDFLARE_ACCOUNT_ID (must be 32-character hex Account ID from Cloudflare Dashboard).");
             process.exit(1);
           }
           (async () => {
-            const verifyRes = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
+            // Support User API tokens, Account API tokens, or minimal Workers-only tokens
+            const userVerify = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
+              headers: { Authorization: `Bearer ${token}` }
+            }).then(r => r.json().catch(() => ({}))).catch(() => ({}));
+
+            const acctVerify = !userVerify.success
+              ? await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/tokens/verify`, {
+                  headers: { Authorization: `Bearer ${token}` }
+                }).then(r => r.json().catch(() => ({}))).catch(() => ({}))
+              : { success: false };
+
+            const scriptsCheck = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts`, {
               headers: { Authorization: `Bearer ${token}` }
             });
-            const verifyJson = await verifyRes.json().catch(() => ({}));
-            if (!verifyRes.ok || !verifyJson.success) {
-              console.error("::error::CLOUDFLARE_API_TOKEN verification failed (" + verifyRes.status + "): " + JSON.stringify(verifyJson.errors || verifyJson));
+            const scriptsJson = await scriptsCheck.json().catch(() => ({}));
+
+            if (!scriptsCheck.ok || !scriptsJson.success) {
+              console.error("::error::Cloudflare account/token check failed (HTTP " + scriptsCheck.status + "). Ensure CLOUDFLARE_API_TOKEN grants Workers Scripts:Edit for Account " + accountId + ". Details: " + JSON.stringify(scriptsJson.errors || scriptsJson));
               process.exit(1);
             }
+
             const subRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`, {
               headers: { Authorization: `Bearer ${token}` }
             });
             const subJson = await subRes.json().catch(() => ({}));
-            if (subRes.status === 404 || (subJson.success && !subJson.result?.subdomain)) {
-              console.error("::error::No workers.dev subdomain is configured on Cloudflare Account " + accountId + ". Open Cloudflare Dashboard -> Workers & Pages -> Claim a workers.dev subdomain once.");
+            if (subRes.status === 404 || (subRes.ok && subJson.success && !subJson.result?.subdomain)) {
+              console.error("::error::No workers.dev subdomain is registered on Cloudflare Account " + accountId + ". Open Cloudflare Dashboard -> Workers & Pages -> Overview and claim your free workers.dev subdomain once.");
               process.exit(1);
             }
-            if (!subRes.ok || !subJson.success) {
-              console.error("::error::Cloudflare Account access check failed (" + subRes.status + "). Ensure CLOUDFLARE_API_TOKEN grants Account Settings:Read and Workers Scripts:Edit for account " + accountId + ".");
-              process.exit(1);
+            if (subRes.ok && subJson.result?.subdomain) {
+              console.log("Cloudflare credentials verified (" + (userVerify.success ? "User Token" : acctVerify.success ? "Account Token" : "Workers Scoped Token") + "). Subdomain:", subJson.result.subdomain + ".workers.dev");
+            } else {
+              console.log("::warning::Could not read workers/subdomain (HTTP " + subRes.status + "). Proceeding with wrangler deploy...");
             }
-            console.log("Cloudflare token verified. Account subdomain:", subJson.result.subdomain + ".workers.dev");
           })().catch(err => {
             console.error("::error::" + err.message);
             process.exit(1);
@@ -231,6 +245,10 @@ jobs:
             echo "Building Skill-Flix frontend with VITE_TELEGRAM_API_URL=$API_URL"
           fi
           VITE_TELEGRAM_API_URL="$API_URL" npm run build
+          if [ -n "$API_URL" ]; then
+            grep -q "$API_URL" dist/assets/*.js || (echo "::error::VITE_TELEGRAM_API_URL was not bundled into dist/assets/*.js!" && exit 1)
+            echo "Verified VITE_TELEGRAM_API_URL baked into production bundle."
+          fi
 
       - name: Configure and diagnose Firebase Service Account ADC
         env:
@@ -292,6 +310,8 @@ jobs:
             console.log("Service Account OAuth2 verified for:", creds.client_email);
 
             const checks = [
+              ["Firebase Management API", "https://firebase.googleapis.com/v1beta1/projects/skillflix-academy", "roles/firebase.viewer & firebase.googleapis.com"],
+              ["Cloud Firestore API", "https://firestore.googleapis.com/v1/projects/skillflix-academy/databases/(default)", "roles/datastore.viewer & firestore.googleapis.com"],
               ["Firebase Hosting API", "https://firebasehosting.googleapis.com/v1beta1/projects/skillflix-academy/sites", "roles/firebasehosting.admin & firebasehosting.googleapis.com"],
               ["Firebase Rules API", "https://firebaserules.googleapis.com/v1/projects/skillflix-academy/releases", "roles/firebaserules.admin & firebaserules.googleapis.com"]
             ];
@@ -313,8 +333,11 @@ jobs:
           });
           '
 
-      - name: Deploy Firebase Hosting and Firestore Rules
-        run: npx --yes firebase-tools@13.35.1 deploy --only hosting,firestore:rules --project skillflix-academy --non-interactive
+      - name: Deploy Firebase Hosting
+        run: npx --yes firebase-tools@13.35.1 deploy --only hosting --project skillflix-academy --non-interactive
+
+      - name: Deploy Firestore Security Rules
+        run: npx --yes firebase-tools@13.35.1 deploy --only firestore:rules --project skillflix-academy --non-interactive
 
       - name: Clean up Firebase Service Account file
         if: always()
