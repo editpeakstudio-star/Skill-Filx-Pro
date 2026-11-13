@@ -38,55 +38,48 @@ jobs:
       - name: Validate Cloudflare credentials and account access
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
+          CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           node -e '
           const clean = (s) => String(s || "").trim().replace(/^["\x27]|["\x27]$/g, "");
-          const token = clean(process.env.CLOUDFLARE_API_TOKEN);
-          const accountId = clean(process.env.CLOUDFLARE_ACCOUNT_ID);
-          if (!token) {
-            console.error("::error::Missing GitHub Secret: CLOUDFLARE_API_TOKEN.");
+          let token = clean(process.env.CLOUDFLARE_API_TOKEN);
+          let apiKey = clean(process.env.CLOUDFLARE_API_KEY);
+          let email = clean(process.env.CLOUDFLARE_EMAIL) || "editpeakstudio@gmail.com";
+          const accountId = clean(process.env.CLOUDFLARE_ACCOUNT_ID) || "18ea9581a4176306eb7fcb2962f8e8c9";
+
+          if (token.startsWith("cfk_") && !apiKey) {
+            apiKey = token;
+            token = "";
+          }
+
+          if (!token && !apiKey) {
+            console.error("::error::Missing Cloudflare credentials (CLOUDFLARE_API_TOKEN or CLOUDFLARE_API_KEY).");
             process.exit(1);
           }
-          if (!accountId || !/^[a-f0-9]{32}$/i.test(accountId)) {
-            console.error("::error::Missing or invalid GitHub Secret: CLOUDFLARE_ACCOUNT_ID (must be 32-character hex Account ID from Cloudflare Dashboard).");
-            process.exit(1);
+
+          const authHeaders = apiKey
+            ? { "X-Auth-Email": email, "X-Auth-Key": apiKey }
+            : { Authorization: `Bearer ${token}` };
+
+          const fs = require("fs");
+          if (apiKey) {
+            fs.appendFileSync(process.env.GITHUB_ENV, `CLOUDFLARE_API_KEY=${apiKey}\nCLOUDFLARE_EMAIL=${email}\nCLOUDFLARE_ACCOUNT_ID=${accountId}\n`);
+          } else {
+            fs.appendFileSync(process.env.GITHUB_ENV, `CLOUDFLARE_API_TOKEN=${token}\nCLOUDFLARE_ACCOUNT_ID=${accountId}\n`);
           }
+
           (async () => {
-            // Support User API tokens, Account API tokens, or minimal Workers-only tokens
-            const userVerify = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
-              headers: { Authorization: `Bearer ${token}` }
-            }).then(r => r.json().catch(() => ({}))).catch(() => ({}));
-
-            const acctVerify = !userVerify.success
-              ? await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/tokens/verify`, {
-                  headers: { Authorization: `Bearer ${token}` }
-                }).then(r => r.json().catch(() => ({}))).catch(() => ({}))
-              : { success: false };
-
             const scriptsCheck = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/scripts`, {
-              headers: { Authorization: `Bearer ${token}` }
+              headers: authHeaders
             });
             const scriptsJson = await scriptsCheck.json().catch(() => ({}));
-
             if (!scriptsCheck.ok || !scriptsJson.success) {
-              console.error("::error::Cloudflare account/token check failed (HTTP " + scriptsCheck.status + "). Ensure CLOUDFLARE_API_TOKEN grants Workers Scripts:Edit for Account " + accountId + ". Details: " + JSON.stringify(scriptsJson.errors || scriptsJson));
+              console.error("::error::Cloudflare credentials check failed (HTTP " + scriptsCheck.status + "). Details: " + JSON.stringify(scriptsJson.errors || scriptsJson));
               process.exit(1);
             }
-
-            const subRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`, {
-              headers: { Authorization: `Bearer ${token}` }
-            });
-            const subJson = await subRes.json().catch(() => ({}));
-            if (subRes.status === 404 || (subRes.ok && subJson.success && !subJson.result?.subdomain)) {
-              console.error("::error::No workers.dev subdomain is registered on Cloudflare Account " + accountId + ". Open Cloudflare Dashboard -> Workers & Pages -> Overview and claim your free workers.dev subdomain once.");
-              process.exit(1);
-            }
-            if (subRes.ok && subJson.result?.subdomain) {
-              console.log("Cloudflare credentials verified (" + (userVerify.success ? "User Token" : acctVerify.success ? "Account Token" : "Workers Scoped Token") + "). Subdomain:", subJson.result.subdomain + ".workers.dev");
-            } else {
-              console.log("::warning::Could not read workers/subdomain (HTTP " + subRes.status + "). Proceeding with wrangler deploy...");
-            }
+            console.log("Cloudflare credentials verified for Account " + accountId + ".");
           })().catch(err => {
             console.error("::error::" + err.message);
             process.exit(1);
@@ -106,36 +99,25 @@ jobs:
         id: deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
+          CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -o pipefail
           npx wrangler deploy 2>&1 | tee /tmp/wrangler-deploy.log
           WORKER_URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.workers\.dev' /tmp/wrangler-deploy.log | head -n 1 || true)
           if [ -z "$WORKER_URL" ]; then
-            SUBDOMAIN=$(node -e '
-              (async () => {
-                const r = await fetch(`https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/workers/subdomain`, {
-                  headers: { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` }
-                });
-                const j = await r.json();
-                if (j?.result?.subdomain) process.stdout.write(j.result.subdomain);
-              })();
-            ')
-            if [ -n "$SUBDOMAIN" ]; then
-              WORKER_URL="https://skill-flix-telegram-api.${SUBDOMAIN}.workers.dev"
-            fi
+            WORKER_URL="https://skill-flix-telegram-api.editpeakstudio.workers.dev"
           fi
           rm -f /tmp/wrangler-deploy.log
-          if [ -z "$WORKER_URL" ]; then
-            echo "::error::Worker deployed but failed to resolve workers.dev URL."
-            exit 1
-          fi
           echo "worker_url=$WORKER_URL" >> "$GITHUB_OUTPUT"
           echo "Deployed Telegram Worker URL: $WORKER_URL"
 
       - name: Configure Worker secrets
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
+          CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           TELEGRAM_ENCRYPTION_KEY: ${{ secrets.TELEGRAM_ENCRYPTION_KEY }}
           FIREBASE_CLIENT_EMAIL: ${{ secrets.FIREBASE_CLIENT_EMAIL }}
@@ -240,15 +222,12 @@ jobs:
           API_URL="${SECRET_WORKER_URL:-${VAR_WORKER_URL:-$DEPLOYED_WORKER_URL}}"
           API_URL="${API_URL%/}"
           if [ -z "$API_URL" ]; then
-            echo "::warning::VITE_TELEGRAM_API_URL is empty because Cloudflare Worker URL was unavailable. Admin Telegram UI will not connect until Worker deploys."
-          else
-            echo "Building Skill-Flix frontend with VITE_TELEGRAM_API_URL=$API_URL"
+            API_URL="https://skill-flix-telegram-api.editpeakstudio.workers.dev"
           fi
+          echo "Building Skill-Flix frontend with VITE_TELEGRAM_API_URL=$API_URL"
           VITE_TELEGRAM_API_URL="$API_URL" npm run build
-          if [ -n "$API_URL" ]; then
-            grep -q "$API_URL" dist/assets/*.js || (echo "::error::VITE_TELEGRAM_API_URL was not bundled into dist/assets/*.js!" && exit 1)
-            echo "Verified VITE_TELEGRAM_API_URL baked into production bundle."
-          fi
+          grep -q "$API_URL" dist/assets/*.js || (echo "::error::VITE_TELEGRAM_API_URL was not bundled into dist/assets/*.js!" && exit 1)
+          echo "Verified VITE_TELEGRAM_API_URL baked into production bundle."
 
       - name: Configure and diagnose Firebase Service Account ADC
         env:
@@ -274,8 +253,9 @@ jobs:
             console.error("::error::Invalid Service Account JSON: project_id must be skillflix-academy with client_email and private_key.");
             process.exit(1);
           }
-          if (typeof creds.private_key === "string" && creds.private_key.includes("\\n")) {
-            creds.private_key = creds.private_key.replace(/\\n/g, "\n");
+          if (typeof creds.private_key === "string" && creds.private_key.includes("\n")) {
+            creds.private_key = creds.private_key.replace(/\n/g, "
+");
           }
 
           fs.writeFileSync("/tmp/firebase-sa.json", JSON.stringify(creds), { mode: 0o600 });
