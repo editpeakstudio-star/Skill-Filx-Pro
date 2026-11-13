@@ -52,13 +52,10 @@ jobs:
             JSON.stringify(credentials));
           '
 
-      - name: Authenticate Firebase
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_file: /tmp/firebase-sa.json
-
       - name: Deploy Hosting and Firestore Rules
         run: npx --yes firebase-tools deploy --only hosting,firestore:rules --project skillflix-academy --non-interactive
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: /tmp/firebase-sa.json
 
   cloudflare:
     name: Deploy Telegram Worker
