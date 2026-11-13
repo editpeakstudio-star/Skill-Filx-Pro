@@ -253,9 +253,8 @@ jobs:
             console.error("::error::Invalid Service Account JSON: project_id must be skillflix-academy with client_email and private_key.");
             process.exit(1);
           }
-          if (typeof creds.private_key === "string" && creds.private_key.includes("\n")) {
-            creds.private_key = creds.private_key.replace(/\n/g, "
-");
+          if (typeof creds.private_key === "string") {
+            creds.private_key = creds.private_key.split("\\n").join(String.fromCharCode(10));
           }
 
           fs.writeFileSync("/tmp/firebase-sa.json", JSON.stringify(creds), { mode: 0o600 });
