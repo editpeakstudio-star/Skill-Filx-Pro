@@ -49,6 +49,9 @@ The system includes a responsive student-facing portal, video player, curated PD
 
 ### 1. Install Dependencies
 ```bash
+npm install -D esbuild@^0.28.0
+```
+```bash
 npm install
 ```
 
