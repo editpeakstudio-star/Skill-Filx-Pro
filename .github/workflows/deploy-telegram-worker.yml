@@ -40,19 +40,11 @@ jobs:
         run: |
           node -e '
           const fs = require("fs");
-          const credentials = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-          if (
-            credentials.project_id !== "skillflix-academy" ||
-            !credentials.client_email ||
-            !credentials.private_key
-          ) {
-            throw new Error("Invalid Firebase service account credentials");
+          const c = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+          if (c.project_id !== "skillflix-academy" || !c.client_email || !c.private_key) {
+            throw new Error("Invalid Firebase credentials");
           }
-          fs.writeFileSync(
-            "/tmp/firebase-sa.json",
-            JSON.stringify(credentials),
-            { mode: 0o600 }
-          );
+          fs.writeFileSync("/tmp/firebase-sa.json", JSON.stringify(c), {mode: 0o600});
           console.log("Firebase credentials validated.");
           '
 
