@@ -1,4 +1,4 @@
-import { getAuth } from 'firebase/auth';
+import { getAuth, onAuthStateChanged, type User } from 'firebase/auth';
 import type {
   TelegramBotConfig,
   TelegramDashboardResponse,
@@ -7,12 +7,47 @@ import type {
   TelegramNotificationLog
 } from '../types';
 
-async function getBearerToken(): Promise<string> {
+async function waitForSignedInUser(timeoutMs = 3000): Promise<User> {
   const auth = getAuth();
-  const user = auth.currentUser;
-  if (!user) {
-    throw new Error('You must be signed in to access Telegram Bot Manager.');
+  if (auth.currentUser) {
+    return auth.currentUser;
   }
+
+  return new Promise<User>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      unsub();
+      reject(new Error('You must be signed in to access Telegram Bot Manager.'));
+    }, timeoutMs);
+
+    const unsub = onAuthStateChanged(
+      auth,
+      user => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        unsub();
+        if (user) {
+          resolve(user);
+        } else {
+          reject(new Error('You must be signed in to access Telegram Bot Manager.'));
+        }
+      },
+      err => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        unsub();
+        reject(err instanceof Error ? err : new Error('Authentication check failed.'));
+      }
+    );
+  });
+}
+
+async function getBearerToken(): Promise<string> {
+  const user = await waitForSignedInUser();
   return user.getIdToken();
 }
 
@@ -21,21 +56,97 @@ async function apiRequest<T>(
   options: { method?: string; body?: unknown } = {}
 ): Promise<T> {
   const token = await getBearerToken();
-  const res = await fetch(path, {
-    method: options.method || 'GET',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      ...(options.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
-      Accept: 'application/json'
-    },
-    body: options.body !== undefined ? JSON.stringify(options.body) : undefined
-  });
 
-  const data = (await res.json().catch(() => ({}))) as { error?: string; message?: string };
-  if (!res.ok) {
-    throw new Error(data.error || data.message || `Request failed (${res.status})`);
+  let res: Response;
+  try {
+    res = await fetch(path, {
+      method: options.method || 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...(options.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+        Accept: 'application/json'
+      },
+      body: options.body !== undefined ? JSON.stringify(options.body) : undefined
+    });
+  } catch {
+    throw new Error('Network error reaching Telegram Bot Manager API. Check your connection and try again.');
   }
-  return data as T;
+
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+  const rawText = await res.text().catch(() => '');
+
+  if (!contentType.includes('application/json')) {
+    const looksLikeHtml =
+      contentType.includes('text/html') ||
+      rawText.trimStart().toLowerCase().startsWith('<!doctype') ||
+      rawText.trimStart().toLowerCase().startsWith('<html');
+
+    if (looksLikeHtml) {
+      throw new Error(
+        'Telegram API backend is not connected on this host (received HTML instead of JSON). Deploy Cloud Functions and Firebase Hosting rewrites for /api/telegram/**.'
+      );
+    }
+
+    if (!res.ok) {
+      throw new Error(`Telegram API request failed (${res.status}).`);
+    }
+    throw new Error('Telegram API returned an unexpected non-JSON response.');
+  }
+
+  let data: Record<string, unknown>;
+  try {
+    const parsed = rawText ? JSON.parse(rawText) : {};
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('Invalid JSON object');
+    }
+    data = parsed as Record<string, unknown>;
+  } catch {
+    throw new Error(`Telegram API returned malformed JSON (HTTP ${res.status}).`);
+  }
+
+  if (!res.ok) {
+    const errMsg =
+      (typeof data.error === 'string' && data.error) ||
+      (typeof data.message === 'string' && data.message) ||
+      `Request failed (${res.status})`;
+    throw new Error(errMsg);
+  }
+
+  return data as unknown as T;
+}
+
+function normalizeDashboardResponse(raw: Partial<TelegramDashboardResponse>): TelegramDashboardResponse {
+  const summaryRaw = raw.summary && typeof raw.summary === 'object' ? raw.summary : undefined;
+  const paginationRaw =
+    raw.logsPagination && typeof raw.logsPagination === 'object' ? raw.logsPagination : undefined;
+  const settingsRaw = raw.settings && typeof raw.settings === 'object' ? raw.settings : undefined;
+
+  return {
+    summary: {
+      totalBots: Number(summaryRaw?.totalBots ?? 0),
+      activeBots: Number(summaryRaw?.activeBots ?? 0),
+      inactiveBots: Number(summaryRaw?.inactiveBots ?? 0),
+      totalNotificationsSent: Number(summaryRaw?.totalNotificationsSent ?? 0),
+      totalFailedNotifications: Number(summaryRaw?.totalFailedNotifications ?? 0),
+      lastSuccessfulNotificationAt:
+        typeof summaryRaw?.lastSuccessfulNotificationAt === 'string'
+          ? summaryRaw.lastSuccessfulNotificationAt
+          : null
+    },
+    bots: Array.isArray(raw.bots) ? raw.bots : [],
+    logs: Array.isArray(raw.logs) ? raw.logs : [],
+    logsPagination: {
+      page: Number(paginationRaw?.page ?? 1),
+      pageSize: Number(paginationRaw?.pageSize ?? 10),
+      total: Number(paginationRaw?.total ?? 0),
+      totalPages: Math.max(1, Number(paginationRaw?.totalPages ?? 1))
+    },
+    jobsByPaymentId:
+      raw.jobsByPaymentId && typeof raw.jobsByPaymentId === 'object' ? raw.jobsByPaymentId : {},
+    settings: {
+      notifyOnResolution: Boolean(settingsRaw?.notifyOnResolution)
+    }
+  };
 }
 
 export async function fetchTelegramDashboard(params: {
@@ -50,14 +161,26 @@ export async function fetchTelegramDashboard(params: {
   if (params.page) sp.set('page', String(params.page));
   if (params.pageSize) sp.set('pageSize', String(params.pageSize));
   const qs = sp.toString();
-  return apiRequest<TelegramDashboardResponse>(`/api/telegram/dashboard${qs ? `?${qs}` : ''}`);
+  const data = await apiRequest<Partial<TelegramDashboardResponse>>(
+    `/api/telegram/dashboard${qs ? `?${qs}` : ''}`
+  );
+  return normalizeDashboardResponse(data);
 }
 
 export async function fetchPaymentNotificationJobs(): Promise<{
   jobsByPaymentId: Record<string, TelegramNotificationJob>;
   logsByPaymentId: Record<string, TelegramNotificationLog[]>;
 }> {
-  return apiRequest(`/api/telegram/payment-jobs`);
+  const data = await apiRequest<{
+    jobsByPaymentId?: Record<string, TelegramNotificationJob>;
+    logsByPaymentId?: Record<string, TelegramNotificationLog[]>;
+  }>('/api/telegram/payment-jobs');
+  return {
+    jobsByPaymentId:
+      data.jobsByPaymentId && typeof data.jobsByPaymentId === 'object' ? data.jobsByPaymentId : {},
+    logsByPaymentId:
+      data.logsByPaymentId && typeof data.logsByPaymentId === 'object' ? data.logsByPaymentId : {}
+  };
 }
 
 export async function createTelegramBot(input: {
@@ -139,7 +262,7 @@ export async function updateTelegramManagerSettings(
     method: 'PUT',
     body: settings
   });
-  return res.settings;
+  return res.settings || settings;
 }
 
 export async function retryTelegramLog(

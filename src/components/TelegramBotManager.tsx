@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { Component, ErrorInfo, ReactNode, useCallback, useEffect, useState } from 'react';
 import {
   AlertTriangle,
   Bell,
@@ -74,12 +74,66 @@ function formatDateTime(iso?: string | null): string {
   }
 }
 
+export class TelegramBotManagerBoundary extends Component<
+  { children: ReactNode },
+  { hasError: boolean; errorMessage: string; retryKey: number }
+> {
+  state = { hasError: false, errorMessage: '', retryKey: 0 };
+
+  static getDerivedStateFromError(error: Error) {
+    return {
+      hasError: true,
+      errorMessage: error?.message || 'Unexpected error rendering Telegram Bot Manager.'
+    };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('TelegramBotManager isolated error:', error, info.componentStack);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="p-6 rounded-2xl bg-[#090D16] border border-rose-500/35 text-zinc-100 space-y-3">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <h3 className="text-sm font-bold text-white">Telegram Bot Manager encountered an error</h3>
+              <p className="text-xs text-rose-200/90 leading-relaxed">{this.state.errorMessage}</p>
+              <p className="text-[11px] text-zinc-400">
+                The rest of Skill-Flix and your Admin Panel remain unaffected.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() =>
+              this.setState(prev => ({
+                hasError: false,
+                errorMessage: '',
+                retryKey: prev.retryKey + 1
+              }))
+            }
+            className="min-h-[40px] px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            <span>Retry Telegram Bot Manager</span>
+          </button>
+        </div>
+      );
+    }
+
+    return <React.Fragment key={this.state.retryKey}>{this.props.children}</React.Fragment>;
+  }
+}
+
 export const TelegramBotManager: React.FC = () => {
   const { showToast } = useToast();
 
   const [dashboard, setDashboard] = useState<TelegramDashboardResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   // Filters & Pagination for Logs
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'SENT' | 'FAILED' | 'PENDING'>('ALL');
@@ -111,6 +165,7 @@ export const TelegramBotManager: React.FC = () => {
       try {
         if (silent) setRefreshing(true);
         else setLoading(true);
+        setLoadError(null);
 
         const data = await fetchTelegramDashboard({
           status: statusFilter,
@@ -120,7 +175,9 @@ export const TelegramBotManager: React.FC = () => {
         });
         setDashboard(data);
       } catch (err: unknown) {
-        showToast((err as Error).message || 'Failed to load Telegram Bot Manager.', 'error');
+        const message = (err as Error)?.message || 'Failed to load Telegram Bot Manager.';
+        setLoadError(message);
+        showToast(message, 'error');
       } finally {
         setLoading(false);
         setRefreshing(false);
@@ -322,7 +379,7 @@ export const TelegramBotManager: React.FC = () => {
     if (!dashboard) return;
     setSavingSettings(true);
     try {
-      const next = !dashboard.settings.notifyOnResolution;
+      const next = !Boolean(dashboard.settings?.notifyOnResolution);
       await updateTelegramManagerSettings({ notifyOnResolution: next });
       showToast(
         next
@@ -332,7 +389,7 @@ export const TelegramBotManager: React.FC = () => {
       );
       await loadDashboard(true);
     } catch (err: unknown) {
-      showToast((err as Error).message || 'Failed to update settings.', 'error');
+      showToast((err as Error)?.message || 'Failed to update settings.', 'error');
     } finally {
       setSavingSettings(false);
     }
@@ -418,8 +475,35 @@ export const TelegramBotManager: React.FC = () => {
         </div>
       </div>
 
+      {/* Section-level Backend / Network Error Alert */}
+      {loadError && (
+        <div
+          role="alert"
+          className="p-4 rounded-2xl bg-rose-950/35 border border-rose-500/35 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+        >
+          <div className="flex items-start gap-2.5 min-w-0">
+            <XCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+            <div className="min-w-0">
+              <p className="text-xs font-bold text-rose-200">
+                Could not connect to Telegram Bot Manager backend
+              </p>
+              <p className="text-[11px] text-rose-200/85 mt-0.5 break-words">{loadError}</p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => void loadDashboard(false)}
+            disabled={loading || refreshing}
+            className="min-h-[38px] px-3.5 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold shrink-0 cursor-pointer inline-flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${loading || refreshing ? 'animate-spin' : ''}`} />
+            <span>Retry</span>
+          </button>
+        </div>
+      )}
+
       {/* Warning when no active bots */}
-      {!loading && summary.activeBots === 0 && (
+      {!loading && !loadError && summary.activeBots === 0 && (
         <div className="p-3.5 rounded-2xl bg-amber-950/35 border border-amber-500/35 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="flex items-start gap-2.5">
             <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
@@ -511,12 +595,12 @@ export const TelegramBotManager: React.FC = () => {
           onClick={handleToggleResolutionAlert}
           disabled={savingSettings || !dashboard}
           className={`min-h-[38px] px-3.5 py-1.5 rounded-xl text-xs font-bold cursor-pointer transition-colors shrink-0 whitespace-nowrap border ${
-            dashboard?.settings.notifyOnResolution
+            dashboard?.settings?.notifyOnResolution
               ? 'bg-emerald-600/20 text-emerald-300 border-emerald-500/40'
               : 'bg-zinc-900 text-zinc-400 border-zinc-700 hover:text-white'
           }`}
         >
-          {dashboard?.settings.notifyOnResolution ? 'Resolution Alerts: ON' : 'Resolution Alerts: OFF'}
+          {dashboard?.settings?.notifyOnResolution ? 'Resolution Alerts: ON' : 'Resolution Alerts: OFF'}
         </button>
       </div>
 
@@ -534,6 +618,10 @@ export const TelegramBotManager: React.FC = () => {
           <div className="p-8 rounded-2xl bg-[#090D16] border border-zinc-800 flex items-center justify-center gap-2 text-xs text-zinc-400">
             <Loader2 className="w-4 h-4 animate-spin text-blue-400" />
             <span>Loading configured bots...</span>
+          </div>
+        ) : loadError && !dashboard ? (
+          <div className="p-6 rounded-2xl bg-[#090D16] border border-zinc-800 text-center text-xs text-zinc-400">
+            Telegram bots could not be loaded until the backend connection is restored. Use the <strong className="text-white">Retry</strong> button above.
           </div>
         ) : bots.length === 0 ? (
           <div className="p-8 rounded-2xl bg-[#090D16] border border-zinc-800 text-center space-y-3">

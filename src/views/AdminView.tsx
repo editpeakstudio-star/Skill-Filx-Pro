@@ -102,7 +102,7 @@ import {
   cleanUnwantedLocalRecords
 } from '../services/firebase';
 import { fetchPaymentNotificationJobs, retryTelegramJobFailed } from '../services/telegramApi';
-import { TelegramBotManager } from '../components/TelegramBotManager';
+import { TelegramBotManager, TelegramBotManagerBoundary } from '../components/TelegramBotManager';
 import { useToast } from '../components/Toast';
 
 interface AdminViewProps {
@@ -2706,7 +2706,9 @@ export const AdminView: React.FC<AdminViewProps> = ({
         {/* ======================================================== */}
         {activeTab === 'telegram' && canManageTelegram && (
           <div className="animate-in fade-in duration-150">
-            <TelegramBotManager />
+            <TelegramBotManagerBoundary>
+              <TelegramBotManager />
+            </TelegramBotManagerBoundary>
           </div>
         )}
 
