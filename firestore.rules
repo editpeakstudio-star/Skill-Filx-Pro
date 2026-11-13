@@ -213,7 +213,7 @@ service cloud.firestore {
     match /payment_requests/{id} { allow read, write: if false; }
     match /settings/{id} {
       allow read: if signedIn();
-      allow create, update: if canManageSettings();
+      allow create, update: if canManageSettings() || (id == 'telegram' && canManageTelegram());
       allow delete: if owner();
     }
     match /sales_analytics/{id} {

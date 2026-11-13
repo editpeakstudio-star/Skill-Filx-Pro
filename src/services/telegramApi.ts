@@ -51,15 +51,23 @@ async function getBearerToken(): Promise<string> {
   return user.getIdToken();
 }
 
+const TELEGRAM_API_BASE = (import.meta.env.VITE_TELEGRAM_API_URL || '').trim().replace(/\/+$/, '');
+
+function resolveTelegramUrl(path: string): string {
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  return TELEGRAM_API_BASE ? `${TELEGRAM_API_BASE}${normalizedPath}` : normalizedPath;
+}
+
 async function apiRequest<T>(
   path: string,
   options: { method?: string; body?: unknown } = {}
 ): Promise<T> {
   const token = await getBearerToken();
+  const targetUrl = resolveTelegramUrl(path);
 
   let res: Response;
   try {
-    res = await fetch(path, {
+    res = await fetch(targetUrl, {
       method: options.method || 'GET',
       headers: {
         Authorization: `Bearer ${token}`,
@@ -69,7 +77,9 @@ async function apiRequest<T>(
       body: options.body !== undefined ? JSON.stringify(options.body) : undefined
     });
   } catch {
-    throw new Error('Network error reaching Telegram Bot Manager API. Check your connection and try again.');
+    throw new Error(
+      'Network error reaching Telegram Bot Manager API. Check your connection and VITE_TELEGRAM_API_URL configuration.'
+    );
   }
 
   const contentType = (res.headers.get('content-type') || '').toLowerCase();
@@ -83,7 +93,7 @@ async function apiRequest<T>(
 
     if (looksLikeHtml) {
       throw new Error(
-        'Telegram API backend is not connected on this host (received HTML instead of JSON). Deploy Cloud Functions and Firebase Hosting rewrites for /api/telegram/**.'
+        'Telegram API backend is not connected on this host (received HTML instead of JSON). Deploy the Cloudflare Worker in cloudflare-worker/ and set VITE_TELEGRAM_API_URL in .env.production before building.'
       );
     }
 

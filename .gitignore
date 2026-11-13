@@ -9,3 +9,7 @@ coverage/
 .data/
 functions/node_modules/
 functions/lib/
+cloudflare-worker/node_modules/
+cloudflare-worker/.dev.vars
+cloudflare-worker/.wrangler/
+cloudflare-worker/dist/

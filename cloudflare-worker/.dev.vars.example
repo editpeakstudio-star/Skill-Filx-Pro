@@ -1,0 +1,9 @@
+# Copy to .dev.vars for local wrangler dev testing (never commit .dev.vars)
+TELEGRAM_ENCRYPTION_KEY="GENERATE_64_HEX_CHARACTER_AES256_KEY"
+FIREBASE_PROJECT_ID="skillflix-academy"
+FIREBASE_CLIENT_EMAIL="firebase-adminsdk-xxxxx@skillflix-academy.iam.gserviceaccount.com"
+FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+
+# Optional fallback bot token & chat ID kept purely in environment secrets:
+# TELEGRAM_BOT_TOKEN="123456789:YOUR_TELEGRAM_BOT_TOKEN"
+# TELEGRAM_CHAT_ID="8550142197"
