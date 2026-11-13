@@ -14,84 +14,318 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  firebase:
-    name: Build and Deploy Firebase
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build website
-        run: npm run build
-
-      - name: Create Firebase credentials
-        env:
-          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_SKILLFLIX_ACADEMY }}
-        run: |
-          node -e '
-          const fs = require("fs");
-          const c = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-          if (c.project_id !== "skillflix-academy" || !c.client_email || !c.private_key) {
-            throw new Error("Invalid Firebase credentials");
-          }
-          fs.writeFileSync("/tmp/firebase-sa.json", JSON.stringify(c), {mode: 0o600});
-          console.log("Firebase credentials validated.");
-          '
-
-      - name: Deploy Hosting and Firestore Rules
-        run: npx --yes firebase-tools deploy --only hosting,firestore:rules --project skillflix-academy --non-interactive
-        env:
-          GOOGLE_APPLICATION_CREDENTIALS: /tmp/firebase-sa.json
-
   cloudflare:
     name: Deploy Telegram Worker
     runs-on: ubuntu-latest
+    outputs:
+      worker_url: ${{ steps.deploy.outputs.worker_url }}
 
     defaults:
       run:
         working-directory: cloudflare-worker
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: cloudflare-worker/package-lock.json
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: TypeScript Check
-        run: npm run typecheck
-
-      - name: Deploy Worker
-        run: npx wrangler deploy
+      - name: Validate Cloudflare credentials and account access
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          node -e '
+          const token = (process.env.CLOUDFLARE_API_TOKEN || "").trim();
+          const accountId = (process.env.CLOUDFLARE_ACCOUNT_ID || "").trim();
+          if (!token) {
+            console.error("::error::Missing GitHub Secret: CLOUDFLARE_API_TOKEN. Create an API Token with Workers Scripts:Edit and Account Settings:Read permissions.");
+            process.exit(1);
+          }
+          if (!accountId || !/^[a-f0-9]{32}$/i.test(accountId)) {
+            console.error("::error::Missing or invalid GitHub Secret: CLOUDFLARE_ACCOUNT_ID (expected 32-character hex Account ID from Cloudflare Dashboard).");
+            process.exit(1);
+          }
+          (async () => {
+            const verifyRes = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
+              headers: { Authorization: `Bearer ${token}` }
+            });
+            const verifyJson = await verifyRes.json().catch(() => ({}));
+            if (!verifyRes.ok || !verifyJson.success) {
+              console.error("::error::CLOUDFLARE_API_TOKEN verification failed (" + verifyRes.status + "): " + JSON.stringify(verifyJson.errors || verifyJson));
+              process.exit(1);
+            }
+            const subRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`, {
+              headers: { Authorization: `Bearer ${token}` }
+            });
+            const subJson = await subRes.json().catch(() => ({}));
+            if (subRes.status === 404 || (subJson.success && !subJson.result?.subdomain)) {
+              console.error("::error::No workers.dev subdomain is configured on Cloudflare Account " + accountId + ". Open Cloudflare Dashboard -> Workers & Pages -> Claim a workers.dev subdomain once.");
+              process.exit(1);
+            }
+            if (!subRes.ok || !subJson.success) {
+              console.error("::error::Cloudflare Account access check failed (" + subRes.status + "). Ensure CLOUDFLARE_API_TOKEN grants Account Settings:Read and Workers Scripts:Edit for account " + accountId + ".");
+              process.exit(1);
+            }
+            console.log("Cloudflare token verified. Account subdomain:", subJson.result.subdomain + ".workers.dev");
+          })().catch(err => {
+            console.error("::error::" + err.message);
+            process.exit(1);
+          });
+          '
 
-      - name: Configure Worker Secrets
+      - name: Install Worker dependencies
+        run: npm ci || npm install --no-audit --no-fund
+
+      - name: TypeScript check and dry-run bundle
+        run: |
+          npm run typecheck
+          npx wrangler deploy --dry-run --outdir dist
+          rm -rf dist
+
+      - name: Deploy Worker
+        id: deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -o pipefail
+          npx wrangler deploy 2>&1 | tee /tmp/wrangler-deploy.log
+          WORKER_URL=$(grep -Eo 'https://[a-zA-Z0-9.-]+\.workers\.dev' /tmp/wrangler-deploy.log | head -n 1 || true)
+          if [ -z "$WORKER_URL" ]; then
+            SUBDOMAIN=$(node -e '
+              (async () => {
+                const r = await fetch(`https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/workers/subdomain`, {
+                  headers: { Authorization: `Bearer ${process.env.CLOUDFLARE_API_TOKEN}` }
+                });
+                const j = await r.json();
+                if (j?.result?.subdomain) process.stdout.write(j.result.subdomain);
+              })();
+            ')
+            if [ -n "$SUBDOMAIN" ]; then
+              WORKER_URL="https://skill-flix-telegram-api.${SUBDOMAIN}.workers.dev"
+            fi
+          fi
+          rm -f /tmp/wrangler-deploy.log
+          if [ -z "$WORKER_URL" ]; then
+            echo "::error::Worker deployed but failed to resolve workers.dev URL."
+            exit 1
+          fi
+          echo "worker_url=$WORKER_URL" >> "$GITHUB_OUTPUT"
+          echo "Deployed Telegram Worker URL: $WORKER_URL"
+
+      - name: Configure Worker secrets
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           TELEGRAM_ENCRYPTION_KEY: ${{ secrets.TELEGRAM_ENCRYPTION_KEY }}
           FIREBASE_CLIENT_EMAIL: ${{ secrets.FIREBASE_CLIENT_EMAIL }}
           FIREBASE_PRIVATE_KEY: ${{ secrets.FIREBASE_PRIVATE_KEY }}
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_SKILLFLIX_ACADEMY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          printf '%s' "$TELEGRAM_ENCRYPTION_KEY" | npx wrangler secret put TELEGRAM_ENCRYPTION_KEY
-          printf '%s' "$FIREBASE_CLIENT_EMAIL" | npx wrangler secret put FIREBASE_CLIENT_EMAIL
-          printf '%s' "$FIREBASE_PRIVATE_KEY" | npx wrangler secret put FIREBASE_PRIVATE_KEY
+          node -e '
+          const { execFileSync } = require("child_process");
+
+          function putSecret(name, value) {
+            execFileSync("npx", ["wrangler", "secret", "put", name], {
+              input: value,
+              stdio: ["pipe", "inherit", "inherit"]
+            });
+          }
+
+          let clientEmail = (process.env.FIREBASE_CLIENT_EMAIL || "").trim();
+          let privateKey = (process.env.FIREBASE_PRIVATE_KEY || "").trim();
+          const saRaw = (process.env.FIREBASE_SERVICE_ACCOUNT || "").trim();
+
+          if ((!clientEmail || !privateKey) && saRaw) {
+            try {
+              const sa = JSON.parse(saRaw);
+              if (!clientEmail && sa.client_email) clientEmail = String(sa.client_email).trim();
+              if (!privateKey && sa.private_key) privateKey = String(sa.private_key).trim();
+            } catch (e) {
+              console.warn("Could not parse FIREBASE_SERVICE_ACCOUNT_SKILLFLIX_ACADEMY fallback:", e.message);
+            }
+          }
+
+          const encKey = (process.env.TELEGRAM_ENCRYPTION_KEY || "").trim();
+          if (!encKey) {
+            console.error("::error::Missing GitHub Secret: TELEGRAM_ENCRYPTION_KEY (64-char hex AES-256 key).");
+            process.exit(1);
+          }
+          if (!clientEmail || !privateKey) {
+            console.error("::error::Missing Firebase Worker secrets (FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY or FIREBASE_SERVICE_ACCOUNT_SKILLFLIX_ACADEMY).");
+            process.exit(1);
+          }
+
+          putSecret("TELEGRAM_ENCRYPTION_KEY", encKey);
+          putSecret("FIREBASE_CLIENT_EMAIL", clientEmail);
+          putSecret("FIREBASE_PRIVATE_KEY", privateKey);
+
+          const botToken = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
+          const chatId = (process.env.TELEGRAM_CHAT_ID || "").trim();
+          if (botToken) putSecret("TELEGRAM_BOT_TOKEN", botToken);
+          if (chatId) putSecret("TELEGRAM_CHAT_ID", chatId);
+          console.log("All configured Worker secrets uploaded securely.");
+          '
+
+      - name: Verify live Telegram Worker health
+        env:
+          WORKER_URL: ${{ steps.deploy.outputs.worker_url }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if BODY=$(curl -fsSL "${WORKER_URL}/api/telegram/health"); then
+              echo "Health response: $BODY"
+              node -e '
+                const d = JSON.parse(process.argv[1]);
+                if (!d.ok || d.runtime !== "cloudflare-workers") process.exit(1);
+              ' "$BODY"
+              echo "Telegram Worker live verification PASSED."
+              exit 0
+            fi
+            echo "Waiting for Worker propagation (attempt $attempt/5)..."
+            sleep 3
+          done
+          echo "::error::Telegram Worker health check failed at ${WORKER_URL}/api/telegram/health"
+          exit 1
+
+  firebase:
+    name: Build and Deploy Firebase
+    needs: cloudflare
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci || npm install --no-audit --no-fund
+
+      - name: Lint and TypeScript check
+        run: npm run lint
+
+      - name: Build production website
+        env:
+          DEPLOYED_WORKER_URL: ${{ needs.cloudflare.outputs.worker_url }}
+          VAR_WORKER_URL: ${{ vars.VITE_TELEGRAM_API_URL }}
+          SECRET_WORKER_URL: ${{ secrets.VITE_TELEGRAM_API_URL }}
+        run: |
+          API_URL="${SECRET_WORKER_URL:-${VAR_WORKER_URL:-$DEPLOYED_WORKER_URL}}"
+          API_URL="${API_URL%/}"
+          if [ -z "$API_URL" ]; then
+            echo "::warning::VITE_TELEGRAM_API_URL is empty because Cloudflare Worker URL was unavailable. Admin Telegram UI will not connect until Worker deploys."
+          else
+            echo "Building Skill-Flix frontend with VITE_TELEGRAM_API_URL=$API_URL"
+          fi
+          VITE_TELEGRAM_API_URL="$API_URL" npm run build
+
+      - name: Configure and diagnose Firebase Service Account ADC
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_SKILLFLIX_ACADEMY }}
+        run: |
+          node -e '
+          const fs = require("fs");
+          const crypto = require("crypto");
+
+          const raw = (process.env.FIREBASE_SERVICE_ACCOUNT || "").trim();
+          if (!raw) {
+            console.error("::error::Missing GitHub Secret: FIREBASE_SERVICE_ACCOUNT_SKILLFLIX_ACADEMY.");
+            process.exit(1);
+          }
+          let creds;
+          try {
+            creds = JSON.parse(raw);
+          } catch (err) {
+            console.error("::error::FIREBASE_SERVICE_ACCOUNT_SKILLFLIX_ACADEMY is not valid JSON:", err.message);
+            process.exit(1);
+          }
+          if (creds.project_id !== "skillflix-academy" || !creds.client_email || !creds.private_key) {
+            console.error("::error::Invalid Service Account JSON: project_id must be skillflix-academy with client_email and private_key.");
+            process.exit(1);
+          }
+          if (typeof creds.private_key === "string" && creds.private_key.includes("\\n")) {
+            creds.private_key = creds.private_key.replace(/\\n/g, "\n");
+          }
+
+          fs.writeFileSync("/tmp/firebase-sa.json", JSON.stringify(creds), { mode: 0o600 });
+          fs.appendFileSync(process.env.GITHUB_ENV, "GOOGLE_APPLICATION_CREDENTIALS=/tmp/firebase-sa.json\n");
+
+          (async () => {
+            const now = Math.floor(Date.now() / 1000);
+            const b64u = (v) => Buffer.from(JSON.stringify(v)).toString("base64url");
+            const header = b64u({ alg: "RS256", typ: "JWT" });
+            const claim = b64u({
+              iss: creds.client_email,
+              sub: creds.client_email,
+              aud: "https://oauth2.googleapis.com/token",
+              scope: "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/firebase",
+              iat: now,
+              exp: now + 3600
+            });
+            const sig = crypto.sign("RSA-SHA256", Buffer.from(`${header}.${claim}`), creds.private_key).toString("base64url");
+            const tokRes = await fetch("https://oauth2.googleapis.com/token", {
+              method: "POST",
+              headers: { "Content-Type": "application/x-www-form-urlencoded" },
+              body: new URLSearchParams({
+                grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                assertion: `${header}.${claim}.${sig}`
+              })
+            });
+            const tokJson = await tokRes.json();
+            if (!tokRes.ok || !tokJson.access_token) {
+              console.error("::error::Service Account OAuth2 authentication failed:", JSON.stringify(tokJson));
+              process.exit(1);
+            }
+            console.log("Service Account OAuth2 verified for:", creds.client_email);
+
+            const checks = [
+              ["Firebase Hosting API", "https://firebasehosting.googleapis.com/v1beta1/projects/skillflix-academy/sites", "roles/firebasehosting.admin & firebasehosting.googleapis.com"],
+              ["Firebase Rules API", "https://firebaserules.googleapis.com/v1/projects/skillflix-academy/releases", "roles/firebaserules.admin & firebaserules.googleapis.com"]
+            ];
+            let hasFailure = false;
+            for (const [label, url, hint] of checks) {
+              const r = await fetch(url, { headers: { Authorization: `Bearer ${tokJson.access_token}` } });
+              if (!r.ok) {
+                const body = await r.text().catch(() => "");
+                console.error(`::error::${label} check failed (HTTP ${r.status}). Required: ${hint}. Details: ${body.slice(0, 300)}`);
+                hasFailure = true;
+              } else {
+                console.log(`${label}: OK (HTTP ${r.status})`);
+              }
+            }
+            if (hasFailure) process.exit(1);
+          })().catch(err => {
+            console.error("::error::" + err.message);
+            process.exit(1);
+          });
+          '
+
+      - name: Deploy Firebase Hosting and Firestore Rules
+        run: npx --yes firebase-tools@13.35.1 deploy --only hosting,firestore:rules --project skillflix-academy --non-interactive
+
+      - name: Clean up Firebase Service Account file
+        if: always()
+        run: rm -f /tmp/firebase-sa.json
+
+      - name: Verify live Firebase Hosting deployment
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://skillflix-academy.web.app)
+          echo "Live Hosting HTTP status: $STATUS"
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Expected HTTP 200 from https://skillflix-academy.web.app, got $STATUS"
+            exit 1
+          fi
+          echo "Firebase Hosting live verification PASSED."
