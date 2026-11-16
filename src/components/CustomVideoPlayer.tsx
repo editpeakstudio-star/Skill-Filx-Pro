@@ -1285,9 +1285,9 @@ export const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({
       </div>
 
       {/* Control Buttons Bar */}
-      <div className="flex items-center justify-between gap-1 sm:gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1.5 sm:gap-2">
         {/* Left Side: Playback, Next/Prev, Volume, Time */}
-        <div className="flex items-center gap-0.5 sm:gap-1.5 min-w-0">
+        <div className="flex flex-wrap items-center gap-0.5 sm:gap-1.5 min-w-0 max-w-full">
           {/* Previous Episode */}
           <IconButton
             label={hasPrev ? `Previous Episode: ${prevLessonTitle || ''}` : 'No previous episode'}
@@ -1378,7 +1378,7 @@ export const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({
         </div>
 
         {/* Right Side: Speed, Captions, PiP, Fullscreen, Settings */}
-        <div className="flex items-center gap-0.5 sm:gap-1.5">
+        <div className="flex items-center justify-end gap-0.5 sm:gap-1.5 ml-auto shrink-0">
           {/* Subtitles / Captions Toggle */}
           {kind === 'video' && (
             <IconButton
@@ -1702,7 +1702,8 @@ export const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({
           </div>
         )}
 
-        {/* Top Header Overlay (Title, Lock, Fullscreen Back) */}
+        {/* Top Header Overlay (Fullscreen only) */}
+        {isFullscreen && (
         <div
           className={`absolute inset-x-0 top-0 z-20 flex items-center justify-between p-3 sm:p-5 bg-gradient-to-b from-black/90 via-black/50 to-transparent transition-all duration-300 ${
             controlsVisible ? 'translate-y-0 opacity-100' : 'pointer-events-none -translate-y-3 opacity-0'
@@ -1763,6 +1764,7 @@ export const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({
             ) : null}
           </div>
         </div>
+        )}
 
         {/* Floating Unlock Control When Screen is Locked */}
         {isLocked && (
