@@ -114,7 +114,30 @@ function isPkcs1Der(bytes: Uint8Array): boolean {
 
 function pemToArrayBuffer(pem: string): ArrayBuffer {
   let raw = String(pem || "").trim();
-  if (raw.startsWith("{")) {
+
+  // Strip outer quotes if any (e.g. from CLI or JSON)
+  while ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
+    raw = raw.slice(1, -1).trim();
+  }
+
+  // Handle if raw contains JSON service account or escaped JSON
+  if (raw.includes('"private_key"') || raw.includes('\\"private_key\\"')) {
+    try {
+      let unescaped = raw;
+      if (unescaped.includes('\\"')) {
+        unescaped = unescaped.replace(/\\"/g, '"');
+      }
+      const match = unescaped.match(/"private_key"\s*:\s*"([^"]+)"/);
+      if (match && match[1]) {
+        raw = match[1];
+      } else {
+        const parsed = JSON.parse(unescaped) as { private_key?: string };
+        if (parsed.private_key) raw = String(parsed.private_key);
+      }
+    } catch {
+      // continue with raw
+    }
+  } else if (raw.startsWith("{")) {
     try {
       const parsed = JSON.parse(raw) as { private_key?: string };
       if (parsed.private_key) raw = String(parsed.private_key);
@@ -138,7 +161,11 @@ function pemToArrayBuffer(pem: string): ArrayBuffer {
   }
 
   if (isExplicitPkcs1 || isPkcs1Der(bytes)) {
-    bytes = pkcs1ToPkcs8(bytes);
+    try {
+      bytes = pkcs1ToPkcs8(bytes);
+    } catch {
+      // proceed with raw bytes
+    }
   }
 
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
@@ -316,13 +343,32 @@ export async function getServiceAccountAccessToken(env: WorkerEnv): Promise<stri
   );
 
   const keyData = pemToArrayBuffer(privateKeyPem);
-  const signingKey = await crypto.subtle.importKey(
-    'pkcs8',
-    keyData,
-    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
+  let signingKey: CryptoKey;
+  try {
+    signingKey = await crypto.subtle.importKey(
+      'pkcs8',
+      keyData,
+      { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+  } catch (err: any) {
+    try {
+      const converted = pkcs1ToPkcs8(new Uint8Array(keyData));
+      signingKey = await crypto.subtle.importKey(
+        'pkcs8',
+        converted.buffer,
+        { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+        false,
+        ['sign']
+      );
+    } catch {
+      throw new HttpError(
+        500,
+        `Invalid Firebase private key format: ${err?.message || 'PKCS8 import failed'}. Ensure FIREBASE_PRIVATE_KEY contains the full Google service account private key.`
+      );
+    }
+  }
 
   const signingInput = `${headerB64}.${claimB64}`;
   const sigBuf = await crypto.subtle.sign(

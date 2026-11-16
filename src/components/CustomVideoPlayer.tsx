@@ -371,7 +371,9 @@ export const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({
   const [error, setError] = useState('');
   const [apiFailed, setApiFailed] = useState(false);
   const [scrubTime, setScrubTime] = useState<number | null>(null);
-  const [activity, setActivity] = useState(true);
+  // YouTube-style control visibility: initially hidden when video is playing
+  const [userControlsVisible, setUserControlsVisible] = useState(false);
+  const autoHideTimerRef = useRef<number | undefined>(undefined);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showRemainingTime, setShowRemainingTime] = useState(false);
 
@@ -423,33 +425,90 @@ export const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({
   }, []);
   const showFsButton = fsSupported || kind === 'video';
 
-  /* ---------------- Activity / Auto-Hide Controls ------------------ */
-  const showControls = useCallback(() => {
+  /* ---------------- Android Landscape Orientation Helpers ----------- */
+  const lockLandscapeOrientation = async () => {
+    try {
+      if (typeof screen !== 'undefined' && screen.orientation && typeof (screen.orientation as any).lock === 'function') {
+        await (screen.orientation as any).lock('landscape').catch(() => {
+          return (screen.orientation as any).lock?.('landscape-primary').catch(() => {});
+        });
+        return;
+      }
+      const s = screen as any;
+      if (s.lockOrientation) s.lockOrientation('landscape');
+      else if (s.mozLockOrientation) s.mozLockOrientation('landscape');
+      else if (s.msLockOrientation) s.msLockOrientation('landscape');
+    } catch {
+      // Gracefully ignore if orientation locking is unsupported
+    }
+  };
+
+  const unlockScreenOrientation = () => {
+    try {
+      if (typeof screen !== 'undefined' && screen.orientation && typeof (screen.orientation as any).unlock === 'function') {
+        (screen.orientation as any).unlock();
+        return;
+      }
+      const s = screen as any;
+      if (s.unlockOrientation) s.unlockOrientation();
+      else if (s.mozUnlockOrientation) s.mozUnlockOrientation();
+      else if (s.msUnlockOrientation) s.msUnlockOrientation();
+    } catch {
+      // Gracefully ignore
+    }
+  };
+
+  /* ---------------- Auto-Hide Timer (approx 3s of Inactivity) ------- */
+  const resetAutoHideTimer = useCallback(() => {
+    window.clearTimeout(autoHideTimerRef.current);
     if (isLocked) return;
-    setActivity(true);
-    window.clearTimeout(activityTimer.current);
-    activityTimer.current = window.setTimeout(() => {
-      setActivity(false);
-    }, 2800);
-  }, [isLocked]);
+    // Auto-hide only when playing and no menu is open or scrubbing
+    if (!playing || activeMenu !== 'none' || scrubbingRef.current) {
+      return;
+    }
+    autoHideTimerRef.current = window.setTimeout(() => {
+      setUserControlsVisible(false);
+    }, 3000); // 3 seconds of inactivity
+  }, [isLocked, playing, activeMenu]);
 
+  // Keep controls visible when paused; start 3s auto-hide timer when playing and user revealed controls
   useEffect(() => {
-    showControls();
-    return () => window.clearTimeout(activityTimer.current);
-  }, [showControls]);
+    if (!playing) {
+      window.clearTimeout(autoHideTimerRef.current);
+    } else if (userControlsVisible) {
+      resetAutoHideTimer();
+    }
+    return () => window.clearTimeout(autoHideTimerRef.current);
+  }, [playing, userControlsVisible, resetAutoHideTimer]);
 
-  /* ---------------- Fullscreen Event Listeners --------------------- */
+  /* ---------------- Reveal Controls on User Interaction ------------ */
+  const revealControls = useCallback(() => {
+    if (isLocked) return;
+    setUserControlsVisible(true);
+    resetAutoHideTimer();
+  }, [isLocked, resetAutoHideTimer]);
+
+  /* ---------------- Fullscreen & Orientation Listeners ------------- */
   useEffect(() => {
-    const onChange = () => {
+    const onFullscreenChange = () => {
       const d = document as any;
       const el = d.fullscreenElement || d.webkitFullscreenElement;
-      setIsFullscreen(!!el && el === containerRef.current);
+      const active = !!el && el === containerRef.current;
+      setIsFullscreen(active);
+
+      if (!active) {
+        // Restore normal orientation when exiting fullscreen (e.g. system back gesture / Esc)
+        unlockScreenOrientation();
+      }
     };
-    document.addEventListener('fullscreenchange', onChange);
-    document.addEventListener('webkitfullscreenchange', onChange);
+
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    document.addEventListener('webkitfullscreenchange', onFullscreenChange);
+
     return () => {
-      document.removeEventListener('fullscreenchange', onChange);
-      document.removeEventListener('webkitfullscreenchange', onChange);
+      document.removeEventListener('fullscreenchange', onFullscreenChange);
+      document.removeEventListener('webkitfullscreenchange', onFullscreenChange);
+      unlockScreenOrientation();
     };
   }, []);
 
@@ -837,11 +896,18 @@ export const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({
       setCurrent(0);
       setEnded(false);
       c.play();
+      resetAutoHideTimer();
       return;
     }
-    if (playing) c.pause();
-    else c.play();
-    showControls();
+    if (playing) {
+      c.pause();
+      // Keep controls visible while paused
+      window.clearTimeout(autoHideTimerRef.current);
+    } else {
+      c.play();
+      // When resuming, keep controls visible briefly then auto-hide after 3s of inactivity
+      resetAutoHideTimer();
+    }
   };
 
   const seekTo = (t: number) => {
@@ -901,14 +967,11 @@ export const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({
     const d = document as any;
 
     if (d.fullscreenElement || d.webkitFullscreenElement) {
-      if (d.exitFullscreen) await d.exitFullscreen().catch(() => {});
-      else if (d.webkitExitFullscreen) d.webkitExitFullscreen();
-
       try {
-        if (screen.orientation && (screen.orientation as any).unlock) {
-          (screen.orientation as any).unlock();
-        }
+        if (d.exitFullscreen) await d.exitFullscreen().catch(() => {});
+        else if (d.webkitExitFullscreen) d.webkitExitFullscreen();
       } catch {}
+      unlockScreenOrientation();
       return;
     }
 
@@ -921,15 +984,12 @@ export const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({
         (videoRef.current as any).webkitEnterFullscreen();
       }
 
-      // Orientation lock on supported mobile browsers
-      if (screen.orientation && (screen.orientation as any).lock) {
-        try {
-          await (screen.orientation as any).lock('landscape').catch(() => {});
-        } catch {}
-      }
+      // Automatic landscape orientation on Android devices where supported
+      await lockLandscapeOrientation();
     } catch (e) {
-      console.warn('Fullscreen request failed:', e);
+      console.warn('Native fullscreen notice:', e);
     }
+    resetAutoHideTimer();
   };
 
   const togglePiP = async () => {
@@ -973,12 +1033,12 @@ export const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({
     }
   };
 
-  /* ---------------- Double Tap Seek Gesture Handler ----------------- */
+  /* ---------------- Double Tap Seek & Tap-to-Toggle Controls -------- */
   const handleVideoAreaClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (isLocked) {
       setShowLockHint(true);
-      window.clearTimeout(activityTimer.current);
-      activityTimer.current = window.setTimeout(() => setShowLockHint(false), 2500);
+      window.clearTimeout(autoHideTimerRef.current);
+      autoHideTimerRef.current = window.setTimeout(() => setShowLockHint(false), 2500);
       return;
     }
 
@@ -989,8 +1049,10 @@ export const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({
     const now = Date.now();
     const timeSinceLastTap = now - lastTapRef.current.time;
 
-    // Check if double tap or repeated multi-tap (within 400ms on same side)
-    if (timeSinceLastTap < 400 && lastTapRef.current.side === side) {
+    // Check if double tap or repeated multi-tap (within 350ms on same side)
+    if (timeSinceLastTap < 350 && lastTapRef.current.side === side) {
+      // DOUBLE TAP / MULTI-TAP SEEK DETECTED!
+      // Cancel the pending single tap immediately so controls visibility is NOT toggled!
       if (singleTapTimerRef.current) {
         window.clearTimeout(singleTapTimerRef.current);
         singleTapTimerRef.current = undefined;
@@ -1025,8 +1087,13 @@ export const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({
       }, 750);
 
       lastTapRef.current = { time: now, x: clickX, side };
+
+      // If controls were already visible, reset the 3s auto-hide timer so they don't vanish mid-seek
+      if (controlsVisible) {
+        resetAutoHideTimer();
+      }
     } else {
-      // Single tap candidate
+      // Potential single tap candidate
       lastTapRef.current = { time: now, x: clickX, side };
       accumulatedSeekRef.current = 0;
 
@@ -1034,15 +1101,21 @@ export const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({
         window.clearTimeout(singleTapTimerRef.current);
       }
 
+      // Wait 280ms to confirm it is not a double-tap
       singleTapTimerRef.current = window.setTimeout(() => {
         singleTapTimerRef.current = undefined;
-        // Toggle controls visibility
-        if (!activity) {
-          showControls();
+        // Confirmed Single Tap: YouTube-style toggle
+        if (controlsVisible) {
+          // When controls are visible, tapping anywhere on the video hides them!
+          setUserControlsVisible(false);
+          setActiveMenu('none');
+          window.clearTimeout(autoHideTimerRef.current);
         } else {
-          togglePlay();
+          // When controls are hidden, tapping anywhere on the video shows all controls!
+          setUserControlsVisible(true);
+          resetAutoHideTimer();
         }
-      }, 260);
+      }, 280);
     }
   };
 
@@ -1145,7 +1218,7 @@ export const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({
       default:
         return;
     }
-    showControls();
+    revealControls();
   };
 
   /* ---------------- Fallback: Plain Provider Embed ----------------- */
@@ -1168,7 +1241,7 @@ export const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({
   const remainingTime = Math.max(0, effectiveDuration - shownTime);
   const controlsVisible =
     !isLocked &&
-    (!overlay || !playing || activity || activeMenu !== 'none' || scrubTime !== null || ended);
+    (!overlay || !playing || ended || userControlsVisible || activeMenu !== 'none' || scrubTime !== null);
   const VolIcon = muted || volume === 0 ? VolumeX : volume < 0.5 ? Volume1 : Volume2;
   const speedChoices = rates;
 
@@ -1184,7 +1257,7 @@ export const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({
       }
       onPointerDown={(e) => {
         e.stopPropagation();
-        overlay && showControls();
+        resetAutoHideTimer();
       }}
     >
       {/* Interactive Timeline & Seekbar */}
@@ -1448,7 +1521,9 @@ export const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({
       role="region"
       aria-label={`${title} OTT video player`}
       onKeyDown={onKeyDown}
-      onPointerMove={() => overlay && showControls()}
+      onPointerMove={() => {
+        if (overlay) revealControls();
+      }}
       className={`group/player relative flex w-full select-none flex-col bg-black outline-none overflow-hidden touch-manipulation ${
         isFullscreen ? 'fixed inset-0 z-[9999] h-full w-full' : ''
       }`}
@@ -1524,17 +1599,64 @@ export const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({
               onClick={handleVideoAreaClick}
             />
 
-            {/* Center Play / Pause Pulsing Indicator When Paused */}
-            {!playing && !buffering && !error && !ended && (
+            {/* YouTube-style Center Controls & Dark Scrim (smooth fade-in / fade-out) */}
+            <div
+              className={`absolute inset-0 z-[15] flex items-center justify-center transition-all duration-300 ease-out ${
+                controlsVisible && !buffering && !error && !ended
+                  ? 'opacity-100 pointer-events-auto bg-black/45'
+                  : 'opacity-0 pointer-events-none'
+              }`}
+              onClick={handleVideoAreaClick}
+            >
               <div
-                className="pointer-events-none absolute inset-0 z-10 grid place-items-center transition-all duration-300"
-                aria-hidden="true"
+                className="flex items-center justify-center gap-6 sm:gap-10"
+                onClick={(e) => e.stopPropagation()}
               >
-                <div className="relative grid h-16 w-16 sm:h-20 sm:w-20 place-items-center rounded-full border border-blue-400/30 bg-black/60 text-white shadow-2xl backdrop-blur-md ott-pulse">
-                  <Play className="ml-1 h-7 w-7 sm:h-8 sm:w-8 fill-current text-blue-400" />
-                </div>
+                {/* 10s Backward Seek Button */}
+                <button
+                  type="button"
+                  aria-label="Seek backward 10 seconds"
+                  onClick={() => {
+                    seekBy(-10);
+                    resetAutoHideTimer();
+                  }}
+                  className="flex flex-col items-center justify-center h-12 w-12 sm:h-14 sm:w-14 rounded-full bg-black/60 hover:bg-black/80 text-white/90 hover:text-white border border-white/10 backdrop-blur-md transition-all active:scale-90"
+                >
+                  <RotateCcw className="h-5 w-5 sm:h-6 sm:w-6" />
+                  <span className="text-[9px] sm:text-[10px] font-bold mt-0.5 leading-none">10</span>
+                </button>
+
+                {/* Center Large Play / Pause Button */}
+                <button
+                  type="button"
+                  aria-label={playing ? 'Pause' : 'Play'}
+                  onClick={() => {
+                    togglePlay();
+                  }}
+                  className="flex items-center justify-center h-16 w-16 sm:h-20 sm:w-20 rounded-full bg-blue-600/90 hover:bg-blue-500 text-white shadow-2xl shadow-blue-500/30 border border-blue-400/40 backdrop-blur-md transition-all active:scale-95"
+                >
+                  {playing ? (
+                    <Pause className="h-7 w-7 sm:h-8 sm:w-8 fill-current" />
+                  ) : (
+                    <Play className="ml-1 h-7 w-7 sm:h-8 sm:w-8 fill-current" />
+                  )}
+                </button>
+
+                {/* 10s Forward Seek Button */}
+                <button
+                  type="button"
+                  aria-label="Seek forward 10 seconds"
+                  onClick={() => {
+                    seekBy(10);
+                    resetAutoHideTimer();
+                  }}
+                  className="flex flex-col items-center justify-center h-12 w-12 sm:h-14 sm:w-14 rounded-full bg-black/60 hover:bg-black/80 text-white/90 hover:text-white border border-white/10 backdrop-blur-md transition-all active:scale-90"
+                >
+                  <RotateCw className="h-5 w-5 sm:h-6 sm:w-6" />
+                  <span className="text-[9px] sm:text-[10px] font-bold mt-0.5 leading-none">10</span>
+                </button>
               </div>
-            )}
+            </div>
           </>
         ) : (
           /* YouTube / Vimeo Host */
@@ -1587,7 +1709,7 @@ export const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({
           }`}
           onPointerDown={(e) => {
             e.stopPropagation();
-            showControls();
+            resetAutoHideTimer();
           }}
         >
           {/* Left Title and Episode Badge */}
@@ -1649,7 +1771,7 @@ export const CustomVideoPlayer: React.FC<CustomVideoPlayerProps> = ({
               type="button"
               onClick={() => {
                 setIsLocked(false);
-                showControls();
+                revealControls();
               }}
               className="flex items-center gap-2 px-3 py-2 rounded-full bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs shadow-2xl border border-blue-400/40 backdrop-blur-md transition-all active:scale-95"
             >
