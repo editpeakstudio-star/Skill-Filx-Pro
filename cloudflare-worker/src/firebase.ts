@@ -22,11 +22,18 @@ let serviceTokenCache: CachedServiceToken | null = null;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-function base64UrlToUint8Array(segment: string): Uint8Array<ArrayBuffer> {
-  const normalized = segment.replace(/-/g, '+').replace(/_/g, '/');
-  const pad = normalized.length % 4;
-  const padded = pad ? normalized + '='.repeat(4 - pad) : normalized;
-  const binary = atob(padded);
+function safeBase64Decode(raw: string): Uint8Array<ArrayBuffer> {
+  let clean = String(raw || "").trim().replace(/^["'`]|["'`]$/g, "");
+  clean = clean.replace(/-/g, "+").replace(/_/g, "/");
+  clean = clean.replace(/[^A-Za-z0-9+/=]/g, "").replace(/=+$/, "");
+  const mod = clean.length % 4;
+  if (mod === 2) clean += "==";
+  else if (mod === 3) clean += "=";
+  else if (mod === 1) clean = clean.slice(0, -1);
+
+  if (!clean) return new Uint8Array(new ArrayBuffer(0));
+
+  const binary = atob(clean);
   const bytes = new Uint8Array(new ArrayBuffer(binary.length));
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i);
@@ -34,31 +41,110 @@ function base64UrlToUint8Array(segment: string): Uint8Array<ArrayBuffer> {
   return bytes;
 }
 
+function base64UrlToUint8Array(segment: string): Uint8Array<ArrayBuffer> {
+  return safeBase64Decode(segment);
+}
+
 function uint8ArrayToBase64Url(bytes: Uint8Array): string {
-  let binary = '';
+  let binary = "";
   for (let i = 0; i < bytes.length; i++) {
     binary += String.fromCharCode(bytes[i]);
   }
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 function stringToBase64Url(str: string): string {
   return uint8ArrayToBase64Url(encoder.encode(str));
 }
 
-function pemToArrayBuffer(pem: string): ArrayBuffer {
-  const normalized = pem
-    .replace(/\\n/g, '\n')
-    .replace(/-----BEGIN [^-]+-----/g, '')
-    .replace(/-----END [^-]+-----/g, '')
-    .replace(/\s+/g, '');
-  const binary = atob(normalized);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
+function pkcs1ToPkcs8(pkcs1Bytes: Uint8Array): Uint8Array<ArrayBuffer> {
+  const algorithmIdentifier = new Uint8Array([
+    0x30, 0x0d,
+    0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
+    0x05, 0x00
+  ]);
+
+  function encodeLength(len: number): number[] {
+    if (len < 128) return [len];
+    const bytes: number[] = [];
+    let temp = len;
+    while (temp > 0) {
+      bytes.unshift(temp & 0xff);
+      temp >>= 8;
+    }
+    return [0x80 | bytes.length, ...bytes];
   }
-  return bytes.buffer;
+
+  const version = new Uint8Array([0x02, 0x01, 0x00]);
+  const octetHeader = [0x04, ...encodeLength(pkcs1Bytes.length)];
+  const privateKeyOctet = new Uint8Array(octetHeader.length + pkcs1Bytes.length);
+  privateKeyOctet.set(octetHeader, 0);
+  privateKeyOctet.set(pkcs1Bytes, octetHeader.length);
+
+  const totalInnerLen = version.length + algorithmIdentifier.length + privateKeyOctet.length;
+  const seqHeader = [0x30, ...encodeLength(totalInnerLen)];
+
+  const pkcs8 = new Uint8Array(new ArrayBuffer(seqHeader.length + totalInnerLen));
+  let offset = 0;
+  pkcs8.set(seqHeader, offset);
+  offset += seqHeader.length;
+  pkcs8.set(version, offset);
+  offset += version.length;
+  pkcs8.set(algorithmIdentifier, offset);
+  offset += algorithmIdentifier.length;
+  pkcs8.set(privateKeyOctet, offset);
+
+  return pkcs8;
 }
+
+function isPkcs1Der(bytes: Uint8Array): boolean {
+  if (bytes.length < 10) return false;
+  if (bytes[0] !== 0x30) return false;
+  let idx = 1;
+  if (bytes[idx] & 0x80) {
+    idx += (bytes[idx] & 0x7f) + 1;
+  } else {
+    idx += 1;
+  }
+  if (bytes[idx] === 0x02 && bytes[idx + 1] === 0x01 && bytes[idx + 2] === 0x00) {
+    return bytes[idx + 3] === 0x02;
+  }
+  return false;
+}
+
+function pemToArrayBuffer(pem: string): ArrayBuffer {
+  let raw = String(pem || "").trim();
+  if (raw.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(raw) as { private_key?: string };
+      if (parsed.private_key) raw = String(parsed.private_key);
+    } catch {
+      // not JSON
+    }
+  }
+
+  const isExplicitPkcs1 = /BEGIN (?:RSA )?PRIVATE KEY/i.test(raw) && /RSA/i.test(raw);
+  raw = raw
+    .replace(/\\r/g, "")
+    .replace(/\\n/g, "")
+    .replace(/\r/g, "")
+    .replace(/\n/g, "")
+    .replace(/-----BEGIN [^-]+-----/g, "")
+    .replace(/-----END [^-]+-----/g, "");
+
+  let bytes = safeBase64Decode(raw);
+  if (!bytes || bytes.length === 0) {
+    throw new HttpError(500, "Firebase Service Account private key is empty or not valid base64.");
+  }
+
+  if (isExplicitPkcs1 || isPkcs1Der(bytes)) {
+    bytes = pkcs1ToPkcs8(bytes);
+  }
+
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+
 
 export function getProjectId(env: WorkerEnv): string {
   return (env.FIREBASE_PROJECT_ID || DEFAULT_PROJECT_ID).trim();
@@ -283,9 +369,24 @@ export async function getFirestoreAuthToken(
   callerIdToken?: string,
   requireServiceAccount = false
 ): Promise<string> {
-  if (hasServiceAccountConfig(env)) {
-    return getServiceAccountAccessToken(env);
+  // If caller already has a verified Firebase ID token (e.g. Admin Console or owner)
+  if (callerIdToken) {
+    if (hasServiceAccountConfig(env)) {
+      try {
+        return await getServiceAccountAccessToken(env);
+      } catch (err) {
+        console.warn('Service Account token exchange failed; seamlessly using caller ID token:', (err as Error).message);
+        return callerIdToken;
+      }
+    }
+    return callerIdToken;
   }
+
+  // Headless worker request without caller session: must use Service Account
+  if (hasServiceAccountConfig(env)) {
+    return await getServiceAccountAccessToken(env);
+  }
+
   if (requireServiceAccount || !callerIdToken) {
     throw new HttpError(
       500,

@@ -94,6 +94,10 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
     .filter(l => l.categoryId === video.categoryId)
     .sort((a, b) => (a.order || 0) - (b.order || 0));
 
+  const currentIndex = categoryLessons.findIndex(l => l.id === video.id);
+  const prevLesson = currentIndex > 0 ? categoryLessons[currentIndex - 1] : null;
+  const nextLesson = currentIndex >= 0 && currentIndex < categoryLessons.length - 1 ? categoryLessons[currentIndex + 1] : null;
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-0 sm:p-4 bg-black/95 backdrop-blur-xl overflow-hidden">
       <div className="relative w-full max-w-5xl bg-[#070B14] border border-blue-500/20 sm:rounded-3xl shadow-2xl overflow-hidden flex flex-col h-[100dvh] max-h-[100dvh] sm:h-auto sm:max-h-[92vh]">
@@ -142,6 +146,21 @@ export const VideoPlayerModal: React.FC<VideoPlayerModalProps> = ({
               vimeoHash={embed.hash}
               title={video.title}
               fallbackSrc={embed.src}
+              lessonId={video.id}
+              episode={video.episode}
+              categoryName={video.categoryName}
+              durationStr={video.duration}
+              thumbnailUrl={video.thumbnailUrl}
+              onNext={nextLesson ? () => onSelectVideo(nextLesson) : undefined}
+              onPrev={prevLesson ? () => onSelectVideo(prevLesson) : undefined}
+              hasNext={!!nextLesson}
+              hasPrev={!!prevLesson}
+              nextLessonTitle={nextLesson ? `${nextLesson.episode || ''} ${nextLesson.title}`.trim() : undefined}
+              prevLessonTitle={prevLesson ? `${prevLesson.episode || ''} ${prevLesson.title}`.trim() : undefined}
+              onClose={onClose}
+              onComplete={() => {
+                if (!isCompleted) handleToggleComplete();
+              }}
             />
           )}
 
