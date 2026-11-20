@@ -1,5 +1,6 @@
 import * as admin from 'firebase-admin';
 import * as crypto from 'node:crypto';
+import * as functionsV1 from 'firebase-functions/v1';
 import { onDocumentCreated, onDocumentUpdated } from 'firebase-functions/v2/firestore';
 import { onCall, onRequest, HttpsError } from 'firebase-functions/v2/https';
 import { defineSecret } from 'firebase-functions/params';
@@ -640,7 +641,7 @@ async function verifyCaller(authHeader?: string) {
 
 async function authorizeAdminCaller(
   authHeader: string | undefined,
-  requiredPermission: 'telegram.manage' | 'payments.verify' = 'telegram.manage'
+  requiredPermission: 'telegram.manage' | 'payments.verify' | 'students.manage' = 'telegram.manage'
 ) {
   const decoded = await verifyCaller(authHeader);
   const email = (decoded.email || '').trim().toLowerCase();
@@ -668,13 +669,14 @@ async function authorizeAdminCaller(
   if (role === 'admin') {
     const allowed =
       permissions.includes(requiredPermission) ||
-      (requiredPermission === 'telegram.manage' && permissions.includes('settings.manage'));
+      (requiredPermission === 'telegram.manage' && permissions.includes('settings.manage')) ||
+      (requiredPermission === 'students.manage' && permissions.includes('payments.verify'));
     if (allowed) {
       return { uid: decoded.uid, email, role: 'admin' as const };
     }
   }
 
-  throw new HttpStatusError(403, 'Forbidden: You do not have permission to manage Telegram payment bots.');
+  throw new HttpStatusError(403, 'Forbidden: You do not have permission to perform this administrative action.');
 }
 
 // ======================================================
@@ -1261,5 +1263,207 @@ export const retryFailedTelegramLog = onCall(
     } catch (err) {
       throw new HttpsError('internal', sanitizeError((err as Error).message));
     }
+  }
+);
+
+// ======================================================
+// AUTOMATIC AUTH -> FIRESTORE USER REGISTRATION & BACKFILL
+// ======================================================
+
+function resolveAuthProviderFromRecord(user: {
+  providerData?: Array<{ providerId?: string }>;
+  phoneNumber?: string;
+}): string {
+  const ids = (user.providerData || []).map(p => (p.providerId || '').toLowerCase());
+  if (ids.includes('google.com')) return 'google';
+  if (ids.includes('phone') || (user.phoneNumber && ids.length === 0)) return 'phone';
+  if (ids.includes('password')) return 'password';
+  return ids[0] || 'other';
+}
+
+function buildUserDocFromAuthRecord(user: admin.auth.UserRecord) {
+  const email = (user.email || '').trim().toLowerCase();
+  const isOwner = email === PLATFORM_OWNER_EMAIL;
+  const createdAtIso = user.metadata.creationTime
+    ? new Date(user.metadata.creationTime).toISOString()
+    : new Date().toISOString();
+  const lastLoginIso = user.metadata.lastSignInTime
+    ? new Date(user.metadata.lastSignInTime).toISOString()
+    : createdAtIso;
+  const displayName =
+    (user.displayName || '').trim() ||
+    (email ? email.split('@')[0] : '') ||
+    user.phoneNumber ||
+    'Student';
+  const suspended = user.disabled === true && !isOwner;
+
+  return {
+    uid: user.uid,
+    email,
+    displayName,
+    photoURL: user.photoURL || '',
+    phoneNumber: user.phoneNumber || '',
+    authProvider: resolveAuthProviderFromRecord(user),
+    role: isOwner ? 'master_admin' : 'user',
+    hasAllAccess: isOwner,
+    allowedCategories: [] as string[],
+    assignedCourses: [] as string[],
+    subscriptionStatus: 'none' as const,
+    accessExpiry: null as string | null,
+    accountStatus: suspended ? 'suspended' : 'active',
+    isSuspended: suspended,
+    createdAt: createdAtIso,
+    lastLogin: lastLoginIso,
+    lastLoginAt: lastLoginIso,
+    ...(isOwner ? { isPlatformOwner: true } : {})
+  };
+}
+
+export const onAuthUserCreated = functionsV1
+  .region('us-central1')
+  .auth.user()
+  .onCreate(async user => {
+    const userRef = db.collection('users').doc(user.uid);
+    const snap = await userRef.get();
+    if (snap.exists) return;
+
+    const email = (user.email || '').trim().toLowerCase();
+    const isOwner = email === PLATFORM_OWNER_EMAIL;
+    const nowIso = new Date().toISOString();
+    const createdAtIso = user.metadata.creationTime
+      ? new Date(user.metadata.creationTime).toISOString()
+      : nowIso;
+    const provider = resolveAuthProviderFromRecord(
+      user as unknown as { providerData?: Array<{ providerId?: string }>; phoneNumber?: string }
+    );
+
+    await userRef.set(
+      {
+        uid: user.uid,
+        email,
+        displayName:
+          (user.displayName || '').trim() ||
+          (email ? email.split('@')[0] : '') ||
+          user.phoneNumber ||
+          'Student',
+        photoURL: user.photoURL || '',
+        phoneNumber: user.phoneNumber || '',
+        authProvider: provider,
+        role: isOwner ? 'master_admin' : 'user',
+        hasAllAccess: isOwner,
+        allowedCategories: [],
+        assignedCourses: [],
+        subscriptionStatus: 'none',
+        accessExpiry: null,
+        accountStatus: 'active',
+        isSuspended: false,
+        createdAt: createdAtIso,
+        lastLogin: nowIso,
+        lastLoginAt: nowIso,
+        ...(isOwner ? { isPlatformOwner: true } : {})
+      },
+      { merge: true }
+    );
+  });
+
+async function backfillAllAuthUsersToFirestore(): Promise<{
+  syncedCount: number;
+  totalAuthUsers: number;
+  alreadySyncedCount: number;
+}> {
+  const authUsers: admin.auth.UserRecord[] = [];
+  let pageToken: string | undefined;
+  do {
+    const result = await admin.auth().listUsers(1000, pageToken);
+    authUsers.push(...result.users);
+    pageToken = result.pageToken;
+  } while (pageToken);
+
+  const existingSnap = await db.collection('users').select().get();
+  const existingUids = new Set(existingSnap.docs.map(d => d.id));
+
+  let syncedCount = 0;
+  let batch = db.batch();
+  let batchOps = 0;
+
+  for (const userRecord of authUsers) {
+    if (existingUids.has(userRecord.uid)) continue;
+    const userRef = db.collection('users').doc(userRecord.uid);
+    batch.set(userRef, buildUserDocFromAuthRecord(userRecord));
+    existingUids.add(userRecord.uid);
+    syncedCount++;
+    batchOps++;
+
+    if (batchOps >= 400) {
+      await batch.commit();
+      batch = db.batch();
+      batchOps = 0;
+    }
+  }
+
+  if (batchOps > 0) {
+    await batch.commit();
+  }
+
+  return {
+    syncedCount,
+    totalAuthUsers: authUsers.length,
+    alreadySyncedCount: Math.max(0, authUsers.length - syncedCount)
+  };
+}
+
+export const userManagementApi = onRequest(
+  {
+    region: 'us-central1',
+    cors: true
+  },
+  async (req, res) => {
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    const method = req.method.toUpperCase();
+    const rawPath = (req.path || '/').replace(/^\/api\/admin/, '') || '/';
+    try {
+      if (method === 'POST' && rawPath === '/sync-users') {
+        await authorizeAdminCaller(req.headers.authorization, 'students.manage');
+        const outcome = await backfillAllAuthUsersToFirestore();
+        res.status(200).json(outcome);
+        return;
+      }
+      res.status(404).json({ error: `Unknown admin route: ${method} ${rawPath}` });
+    } catch (err) {
+      if (err instanceof HttpStatusError) {
+        res.status(err.status).json({ error: err.message });
+        return;
+      }
+      res.status(500).json({ error: sanitizeError((err as Error).message || 'Sync failed.') });
+    }
+  }
+);
+
+export const syncAuthUsersToFirestore = onCall(
+  {
+    region: 'us-central1'
+  },
+  async request => {
+    if (!request.auth) {
+      throw new HttpsError('unauthenticated', 'Authentication required.');
+    }
+    const email = (request.auth.token.email || '').toLowerCase();
+    const isOwner = email === PLATFORM_OWNER_EMAIL && request.auth.token.email_verified === true;
+    if (!isOwner) {
+      const userDoc = await db.collection('users').doc(request.auth.uid).get();
+      const profile = userDoc.data();
+      const allowed =
+        profile &&
+        profile.isSuspended !== true &&
+        (profile.role === 'master_admin' ||
+          (profile.role === 'admin' &&
+            Array.isArray(profile.permissions) &&
+            (profile.permissions.includes('students.manage') ||
+              profile.permissions.includes('payments.verify'))));
+      if (!allowed) {
+        throw new HttpsError('permission-denied', 'Student management permission required.');
+      }
+    }
+    return backfillAllAuthUsersToFirestore();
   }
 );

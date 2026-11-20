@@ -84,11 +84,21 @@ service cloud.firestore {
           'createdAt','updatedAt'
         ]);
     }
+    function userHasActiveWindow(u) {
+      return u.isSuspended != true
+        && u.get('accountStatus', 'active') != 'suspended'
+        && u.get('subscriptionStatus', 'none') != 'expired'
+        && (!('accessExpiryAt' in u) || u.accessExpiryAt == null || u.accessExpiryAt > request.time);
+    }
     function ownsEntitlement(categoryId) {
       return signedIn() && exists(userPath(request.auth.uid))
+        && userHasActiveWindow(get(userPath(request.auth.uid)).data)
         && (get(userPath(request.auth.uid)).data.hasAllAccess == true
           || (get(userPath(request.auth.uid)).data.allowedCategories is list
-            && get(userPath(request.auth.uid)).data.allowedCategories.hasAny([categoryId])));
+            && get(userPath(request.auth.uid)).data.allowedCategories.hasAny([categoryId]))
+          || ('assignedCourses' in get(userPath(request.auth.uid)).data
+            && get(userPath(request.auth.uid)).data.assignedCourses is list
+            && get(userPath(request.auth.uid)).data.assignedCourses.hasAny([categoryId])));
     }
     function canReadVideo() {
       return activeAdmin() || (signedIn() && resource.data.isPublished == true
@@ -109,22 +119,37 @@ service cloud.firestore {
           && request.resource.data.isPlatformOwner == false
           && request.resource.data.hasAllAccess == false
           && request.resource.data.isSuspended == false
+          && (!('accountStatus' in request.resource.data) || request.resource.data.accountStatus == 'active')
           && request.resource.data.subscriptionStatus == 'none'
           && request.resource.data.allowedCategories is list
           && request.resource.data.allowedCategories.size() == 0
-          && request.resource.data.email == (request.auth.token.email == null ? '' : request.auth.token.email)
+          && (!('assignedCourses' in request.resource.data)
+            || (request.resource.data.assignedCourses is list && request.resource.data.assignedCourses.size() == 0))
+          && (!('uid' in request.resource.data) || request.resource.data.uid == uid)
+          && (!('accessExpiry' in request.resource.data) || request.resource.data.accessExpiry == null)
+          && (!('accessExpiryAt' in request.resource.data) || request.resource.data.accessExpiryAt == null)
+          && request.resource.data.displayName is string
+          && request.resource.data.displayName.size() <= 160
+          && request.resource.data.email is string
+          && request.resource.data.email.size() <= 320
+          && (('email' in request.auth.token && request.auth.token.email != null)
+            ? request.resource.data.email.lower() == request.auth.token.email.lower()
+            : request.resource.data.email == '')
           && request.resource.data.keys().hasOnly([
-            'email','displayName','photoURL','phoneNumber','role','isPlatformOwner',
-            'predefinedRole','assignedRoleTitle','permissions','isSuspended','hasAllAccess',
-            'allowedCategories','allowedFolders','subscriptionStatus','accessExpiry','lastLogin','createdAt'
+            'uid','email','displayName','photoURL','phoneNumber','authProvider','role','isPlatformOwner',
+            'predefinedRole','assignedRoleTitle','permissions','isSuspended','accountStatus','hasAllAccess',
+            'allowedCategories','allowedFolders','assignedCourses','subscriptionStatus','accessExpiry',
+            'accessExpiryAt','lastLogin','lastLoginAt','createdAt'
           ]));
       allow update: if (owner() && uid != request.auth.uid
-          && resource.data.role != 'master_admin')
+          && resource.data.role != 'master_admin'
+          && resource.data.isPlatformOwner != true)
         || (canManageAdmins() && uid != request.auth.uid
+          && resource.data.isPlatformOwner != true
           && resource.data.role != 'master_admin'
           && request.resource.data.role in ['user','admin']
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-            'role','predefinedRole','assignedRoleTitle','permissions','isSuspended'
+            'role','predefinedRole','assignedRoleTitle','permissions','isSuspended','accountStatus'
           ])
           && request.resource.data.permissions is list
           && (masterAdmin() || request.resource.data.permissions.hasOnly(profile().permissions))
@@ -135,23 +160,48 @@ service cloud.firestore {
             'telegram.manage'
           ]))
         || (owner() && uid != request.auth.uid && resource.data.role == 'master_admin'
+          && resource.data.isPlatformOwner != true
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-            'role','predefinedRole','assignedRoleTitle','permissions','isSuspended','hasAllAccess','subscriptionStatus'
+            'role','predefinedRole','assignedRoleTitle','permissions','isSuspended','accountStatus','hasAllAccess','subscriptionStatus'
           ]))
         || ((canManageUsers() || canVerifyPayments()) && uid != request.auth.uid
+          && resource.data.isPlatformOwner != true
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          'hasAllAccess','allowedCategories','subscriptionStatus','accessExpiry'
-        ]))
+            'hasAllAccess','allowedCategories','assignedCourses','subscriptionStatus','accessExpiry','accessExpiryAt'
+          ])
+          && request.resource.data.hasAllAccess is bool
+          && request.resource.data.allowedCategories is list
+          && request.resource.data.allowedCategories.size() <= 200
+          && (!('assignedCourses' in request.resource.data)
+            || (request.resource.data.assignedCourses is list && request.resource.data.assignedCourses.size() <= 200))
+          && request.resource.data.subscriptionStatus in ['active','cancelled','expired','none']
+          && (!('accessExpiry' in request.resource.data)
+            || request.resource.data.accessExpiry == null
+            || (request.resource.data.accessExpiry is string && request.resource.data.accessExpiry.size() <= 64))
+          && (!('accessExpiryAt' in request.resource.data)
+            || request.resource.data.accessExpiryAt == null
+            || request.resource.data.accessExpiryAt is timestamp))
+        || ((canManageUsers() || owner()) && uid != request.auth.uid
+          && resource.data.isPlatformOwner != true
+          && (owner() || resource.data.role != 'master_admin')
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'isSuspended','accountStatus'
+          ])
+          && request.resource.data.isSuspended is bool
+          && (!('accountStatus' in request.resource.data)
+            || request.resource.data.accountStatus in ['active','suspended']))
         || (self(uid) && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          'displayName','photoURL','phoneNumber','lastLogin'
+          'uid','displayName','photoURL','phoneNumber','authProvider','lastLogin','lastLoginAt'
         ])
           && request.resource.data.email == resource.data.email
-          && request.resource.data.role == resource.data.role)
+          && request.resource.data.role == resource.data.role
+          && (!('uid' in request.resource.data) || request.resource.data.uid == uid))
         || (owner() && self(uid) && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-          'displayName','photoURL','phoneNumber','lastLogin','isPlatformOwner'
-        ])
-          && request.resource.data.role == resource.data.role);
-      allow delete: if owner() && uid != request.auth.uid;
+          'uid','displayName','photoURL','phoneNumber','authProvider','lastLogin','lastLoginAt',
+          'isPlatformOwner','role','hasAllAccess','subscriptionStatus','accountStatus','isSuspended',
+          'permissions','predefinedRole','assignedRoleTitle'
+        ]));
+      allow delete: if owner() && uid != request.auth.uid && resource.data.isPlatformOwner != true;
     }
 
     match /categories/{id} {
@@ -193,10 +243,12 @@ service cloud.firestore {
         && request.resource.data.planType in ['all_access','category']
         && (request.resource.data.planType != 'category' || request.resource.data.categoryId is string)
         && request.resource.data.amount is number && request.resource.data.amount > 0
-        && request.resource.data.utr is string && request.resource.data.utr.size() > 0
+        && request.resource.data.utr is string && request.resource.data.utr.size() > 0 && request.resource.data.utr.size() <= 128
         && request.resource.data.proofUrl is string
         && request.resource.data.proofUrl.size() <= 900000
-        && request.resource.data.userEmail == (request.auth.token.email == null ? '' : request.auth.token.email)
+        && (('email' in request.auth.token && request.auth.token.email != null)
+          ? request.resource.data.userEmail.lower() == request.auth.token.email.lower()
+          : request.resource.data.userEmail == '')
         && request.resource.data.keys().hasOnly([
           'id','uid','userEmail','userName','planType','categoryId','categoryName',
           'amount','utr','proofUrl','status','submittedAt'
@@ -204,7 +256,9 @@ service cloud.firestore {
       allow get, list: if signedIn() && (resource.data.uid == request.auth.uid || canVerifyPayments());
       allow update: if canVerifyPayments() && resource.data.status == 'pending'
         && request.resource.data.status in ['approved','rejected']
-        && request.resource.data.resolvedBy == (request.auth.token.email == null ? '' : request.auth.token.email)
+        && (('email' in request.auth.token && request.auth.token.email != null)
+          ? request.resource.data.resolvedBy.lower() == request.auth.token.email.lower()
+          : request.resource.data.resolvedBy == '')
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
           'status','adminNote','resolvedAt','resolvedBy'
         ]);

@@ -327,7 +327,7 @@ export async function deleteFirestoreDocument(
 
 export async function authorizeAdmin(
   idToken: string,
-  requiredPermission: 'telegram.manage' | 'payments.verify' = 'telegram.manage'
+  requiredPermission: 'telegram.manage' | 'payments.verify' | 'students.manage' = 'telegram.manage'
 ): Promise<VerifiedAdminContext> {
   const user = await verifyFirebaseIdToken(idToken);
   const isOwner = user.email.toLowerCase() === PLATFORM_OWNER_EMAIL && user.emailVerified;
@@ -336,7 +336,7 @@ export async function authorizeAdmin(
     return {
       ...user,
       role: 'owner',
-      permissions: ['telegram.manage', 'payments.verify', 'settings.manage']
+      permissions: ['telegram.manage', 'payments.verify', 'settings.manage', 'students.manage']
     };
   }
 
@@ -360,7 +360,8 @@ export async function authorizeAdmin(
   if (role === 'admin') {
     const allowed =
       permissions.includes(requiredPermission) ||
-      (requiredPermission === 'telegram.manage' && permissions.includes('settings.manage'));
+      (requiredPermission === 'telegram.manage' && permissions.includes('settings.manage')) ||
+      (requiredPermission === 'students.manage' && permissions.includes('payments.verify'));
     if (allowed) {
       return { ...user, role: 'admin', permissions };
     }

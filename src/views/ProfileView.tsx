@@ -14,7 +14,7 @@ import {
   ChevronRight
 } from 'lucide-react';
 import { UserProfile, Category, VideoLesson, PaymentRequest, PlatformSettings } from '../types';
-import { logoutUser, getWatchProgress } from '../services/firebase';
+import { logoutUser, getWatchProgress, isUserAccessActive, isUserAccessExpired } from '../services/firebase';
 import { useToast } from '../components/Toast';
 
 interface ProfileViewProps {
@@ -72,6 +72,16 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
 
   const completedVideos = videos.filter(v => watchProgress[v.id]);
   const userRequests = paymentRequests.filter(r => r.uid === currentUser.uid || r.userEmail === currentUser.email);
+  const accessExpired = isUserAccessExpired(currentUser);
+  const accessActive = isUserAccessActive(currentUser);
+  const unlockedCategoryIds = Array.from(
+    new Set([...(currentUser.allowedCategories || []), ...(currentUser.assignedCourses || [])])
+  );
+  const expiryLabel = currentUser.accessExpiry
+    ? `${accessExpired ? 'Expired' : 'Valid until'} ${new Date(currentUser.accessExpiry).toLocaleDateString()}`
+    : accessActive
+      ? 'Lifetime / Permanent'
+      : 'No active pass';
 
   return (
     <div className="max-w-4xl mx-auto space-y-6 pb-16">
@@ -80,12 +90,20 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
       <div className="p-6 rounded-3xl bg-[#090D18] border border-white/[0.08] shadow-xl relative overflow-hidden">
         <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
           <div className="flex items-center gap-4">
-            <div className="w-16 h-16 rounded-2xl bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center text-white text-2xl font-bold uppercase shadow-lg shadow-blue-600/20">
-              {currentUser.displayName ? currentUser.displayName[0] : 'U'}
-            </div>
+            {currentUser.photoURL ? (
+              <img
+                src={currentUser.photoURL}
+                alt={currentUser.displayName}
+                className="w-16 h-16 rounded-2xl object-cover border border-blue-500/30 shadow-lg"
+              />
+            ) : (
+              <div className="w-16 h-16 rounded-2xl bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center text-white text-2xl font-bold uppercase shadow-lg shadow-blue-600/20">
+                {currentUser.displayName ? currentUser.displayName[0] : 'U'}
+              </div>
+            )}
 
             <div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <h1 className="text-lg sm:text-xl font-bold text-white">
                   {currentUser.displayName}
                 </h1>
@@ -98,9 +116,18 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                 }`}>
                   {currentUser.role === 'master_admin' ? 'Master Admin' : currentUser.role === 'admin' ? 'Admin' : 'Student'}
                 </span>
+                <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                  currentUser.isSuspended || currentUser.accountStatus === 'suspended'
+                    ? 'bg-red-500/20 text-red-400 border border-red-500/30'
+                    : 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/25'
+                }`}>
+                  {currentUser.isSuspended || currentUser.accountStatus === 'suspended' ? 'Suspended' : 'Active'}
+                </span>
               </div>
-              <p className="text-xs text-slate-400 font-mono mt-0.5">{currentUser.email}</p>
-              <p className="text-[10px] text-slate-500 font-mono mt-0.5">UID: {currentUser.uid}</p>
+              <p className="text-xs text-slate-400 font-mono mt-0.5">{currentUser.email || currentUser.phoneNumber}</p>
+              <p className="text-[10px] text-slate-500 font-mono mt-0.5">
+                UID: {currentUser.uid} • Provider: {currentUser.authProvider || 'email/password'}
+              </p>
             </div>
           </div>
 
@@ -129,32 +156,39 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
 
       {/* Subscription & Pass Access Status */}
       <div className="p-6 rounded-3xl bg-gradient-to-br from-[#0B1124] to-[#070B14] border border-blue-500/20 shadow-xl">
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
           <div className="flex items-center gap-2">
             <Crown className="w-5 h-5 text-amber-400" />
             <h2 className="text-sm sm:text-base font-bold text-white">
               Membership & Unlocked Passes
             </h2>
           </div>
-          <span className={`px-2.5 py-0.5 rounded-full text-xs font-bold uppercase tracking-wider ${
-            currentUser.hasAllAccess
-              ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
-              : currentUser.subscriptionStatus === 'active'
-              ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30'
-              : 'bg-slate-800 text-slate-400'
-          }`}>
-            {currentUser.hasAllAccess ? 'All-Access Active' : currentUser.subscriptionStatus === 'active' ? 'Category Pass' : 'Free Tier'}
-          </span>
+          <div className="flex items-center gap-2">
+            <span className="px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-white/5 text-slate-300 border border-white/10">
+              {expiryLabel}
+            </span>
+            <span className={`px-2.5 py-0.5 rounded-full text-xs font-bold uppercase tracking-wider ${
+              accessExpired
+                ? 'bg-red-500/20 text-red-400 border border-red-500/30'
+                : currentUser.hasAllAccess && accessActive
+                ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                : accessActive
+                ? 'bg-blue-500/20 text-blue-400 border border-blue-500/30'
+                : 'bg-slate-800 text-slate-400'
+            }`}>
+              {accessExpired ? 'Expired' : currentUser.hasAllAccess ? 'All-Access Active' : accessActive ? 'Course Access Active' : 'Free Tier'}
+            </span>
+          </div>
         </div>
 
-        {currentUser.hasAllAccess ? (
+        {currentUser.hasAllAccess && !accessExpired ? (
           <div className="p-4 rounded-2xl bg-emerald-950/20 border border-emerald-500/30 text-emerald-300 text-xs sm:text-sm flex items-center justify-between">
             <div className="flex items-center gap-3">
               <CheckCircle className="w-5 h-5 text-emerald-400 shrink-0" />
               <div>
                 <span className="font-bold block text-white">Universal All-Access Pass Active</span>
                 <span className="text-[11px] text-emerald-400/80">
-                  Unlimited access to all video editing categories, masterclasses, and PDF downloads.
+                  Unlimited access to all video editing categories, masterclasses, and PDF downloads ({expiryLabel}).
                 </span>
               </div>
             </div>
@@ -164,11 +198,11 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
             <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between p-4 rounded-2xl bg-[#05070D] border border-white/[0.08] gap-4">
               <div>
                 <span className="text-xs font-bold text-white block">
-                  Category Passes Unlocked ({currentUser.allowedCategories?.length || 0})
+                  Courses Unlocked ({unlockedCategoryIds.length})
                 </span>
                 <p className="text-[11px] text-slate-400 mt-0.5">
-                  {currentUser.allowedCategories?.length
-                    ? categories.filter(c => currentUser.allowedCategories.includes(c.id)).map(c => c.name).join(', ')
+                  {unlockedCategoryIds.length
+                    ? categories.filter(c => unlockedCategoryIds.includes(c.id)).map(c => c.name).join(', ') || `${unlockedCategoryIds.length} course(s)`
                     : 'No individual categories unlocked yet.'}
                 </p>
               </div>

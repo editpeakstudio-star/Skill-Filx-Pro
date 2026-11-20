@@ -59,12 +59,15 @@ export const SYSTEM_PERMISSIONS: PermissionDefinition[] = [
 
 export type SubscriptionStatus = 'active' | 'cancelled' | 'expired' | 'none';
 
+export type AccountStatus = 'active' | 'suspended';
+
 export interface UserProfile {
   uid: string;
   email: string;
   displayName: string;
   photoURL?: string;
   phoneNumber?: string;
+  authProvider?: string;
   role: UserRole;
   /** Set only when Firebase Auth confirms the designated owner email is verified. */
   isPlatformOwner?: boolean;
@@ -74,12 +77,15 @@ export interface UserProfile {
   assignedRoleTitle?: string;
   permissions?: PermissionKey[];
   isSuspended?: boolean;
+  accountStatus?: AccountStatus;
   hasAllAccess: boolean;
   allowedCategories: string[]; // List of category/root folder IDs user can access
+  assignedCourses?: string[]; // Canonical mirror of allowedCategories for course tracking
   allowedFolders?: string[]; // Specific subfolder overrides if applicable
   subscriptionStatus: SubscriptionStatus;
-  accessExpiry?: string;
+  accessExpiry?: string | null;
   lastLogin?: string;
+  lastLoginAt?: string;
   createdAt: string;
 }
 

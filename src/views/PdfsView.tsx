@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { FileText, Download, Lock, CheckCircle, Search, ExternalLink } from 'lucide-react';
 import { PdfResource, Category, UserProfile } from '../types';
+import { hasCourseAccess } from '../services/firebase';
 
 interface PdfsViewProps {
   pdfs: PdfResource[];
@@ -22,12 +23,8 @@ export const PdfsView: React.FC<PdfsViewProps> = ({
   const [selectedCatId, setSelectedCatId] = useState<string>('all');
 
   const isAdmin = currentUser?.role === 'master_admin' || currentUser?.role === 'admin';
-  const hasAllAccess = currentUser?.hasAllAccess;
 
-  const isUnlocked = (catId: string) => {
-    if (hasAllAccess || isAdmin) return true;
-    return !!currentUser?.allowedCategories?.includes(catId);
-  };
+  const isUnlocked = (catId: string) => hasCourseAccess(currentUser, catId);
 
   const filteredPdfs = pdfs.filter(p => {
     if (!isAdmin && !p.isPublished) return false;

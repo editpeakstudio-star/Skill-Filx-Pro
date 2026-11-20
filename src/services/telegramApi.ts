@@ -319,3 +319,16 @@ export async function notifyPaymentResolution(
     console.warn('Telegram resolution notification note:', (err as Error).message);
   }
 }
+
+export async function syncExistingAuthUsers(): Promise<{
+  syncedCount: number;
+  totalAuthUsers: number;
+  alreadySyncedCount: number;
+  message?: string;
+}> {
+  return apiRequest('/api/admin/sync-users', {
+    method: 'POST',
+    body: {}
+  });
+}
+

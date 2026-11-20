@@ -19,6 +19,7 @@ import {
   ShieldAlert
 } from 'lucide-react';
 import { Category, Folder, VideoLesson, PdfResource, UserProfile } from '../types';
+import { hasCourseAccess } from '../services/firebase';
 
 interface CategoryDetailViewProps {
   category: Category;
@@ -49,8 +50,7 @@ export const CategoryDetailView: React.FC<CategoryDetailViewProps> = ({
   const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
 
   const isAdmin = currentUser?.role === 'master_admin' || currentUser?.role === 'admin';
-  const hasAllAccess = currentUser?.hasAllAccess;
-  const isCategoryUnlocked = hasAllAccess || isAdmin || (currentUser?.allowedCategories?.includes(category.id));
+  const isCategoryUnlocked = hasCourseAccess(currentUser, category.id);
 
   // Subfolders belonging directly to this category or having it as parentId
   const categoryFolders = useMemo(() => {

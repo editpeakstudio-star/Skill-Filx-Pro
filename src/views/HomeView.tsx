@@ -9,6 +9,7 @@ import {
   ArrowRight
 } from 'lucide-react';
 import { Category, Folder, VideoLesson, UserProfile } from '../types';
+import { hasCourseAccess, isUserAccessExpired } from '../services/firebase';
 
 interface HomeViewProps {
   categories: Category[];
@@ -36,16 +37,16 @@ export const HomeView: React.FC<HomeViewProps> = ({
   onSeedCategories
 }) => {
   const isAdmin = currentUser?.role === 'master_admin' || currentUser?.role === 'admin';
-  const hasAllAccess = currentUser?.hasAllAccess;
 
   const isUnlocked = (cat: Category) => {
-    if (hasAllAccess || isAdmin) return true;
+    if (hasCourseAccess(currentUser, cat.id)) return true;
+    if (!currentUser || currentUser.isSuspended || currentUser.accountStatus === 'suspended' || isUserAccessExpired(currentUser)) {
+      return false;
+    }
     const catNameClean = cat.name.toLowerCase().trim();
     const catIdClean = cat.id.toLowerCase().trim();
-    return !!(
-      currentUser?.allowedCategories?.includes(cat.id) ||
-      currentUser?.allowedCategories?.some(c => c.toLowerCase().trim() === catNameClean || c.toLowerCase().trim() === catIdClean)
-    );
+    const courses = [...(currentUser.allowedCategories || []), ...(currentUser.assignedCourses || [])];
+    return courses.some(c => c.toLowerCase().trim() === catNameClean || c.toLowerCase().trim() === catIdClean);
   };
 
   // Robust deduplication by canonical key

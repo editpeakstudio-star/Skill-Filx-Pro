@@ -12,6 +12,7 @@ import {
   getFirestoreAuthToken,
   getFirestoreDoc,
   listFirestoreCollection,
+  syncFirebaseAuthUsersToFirestore,
   upsertFirestoreDoc,
   verifyFirebaseIdToken
 } from './firebase';
@@ -614,6 +615,13 @@ async function handleRequest(request: Request, env: WorkerEnv): Promise<Response
 
     const outcome = await retryFailedJobLogs(env, fsToken, jobId);
     return jsonResponse(request, env, outcome);
+  }
+
+  // POST /api/admin/sync-users
+  if (pathname === '/api/admin/sync-users' && method === 'POST') {
+    await authorizeAdmin(authHeader, env, 'students.manage');
+    const result = await syncFirebaseAuthUsersToFirestore(env);
+    return jsonResponse(request, env, result);
   }
 
   throw new HttpError(404, `Endpoint not found: ${method} ${pathname}`);

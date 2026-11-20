@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   UserProfile, 
   Category, 
@@ -26,6 +26,7 @@ import {
   DEFAULT_SETTINGS,
   logoutUser,
   getWhatsAppUrl,
+  hasCourseAccess,
   UNWANTED_DEMO_VIDEO_IDS,
   UNWANTED_DEMO_PDF_IDS
 } from './services/firebase';
@@ -75,11 +76,20 @@ function AppContent() {
   const [previewVideo, setPreviewVideo] = useState<VideoLesson | null>(null);
   const [viewingPdf, setViewingPdf] = useState<PdfResource | null>(null);
 
+  const lastAuthUidRef = useRef<string | null | undefined>(undefined);
+
   // Subscribe to real-time Firebase / persistence data
   useEffect(() => {
     const unsubAuth = subscribeToAuth((user) => {
+      const nextUid = user?.uid ?? null;
+      const authChanged = lastAuthUidRef.current !== nextUid;
+      lastAuthUidRef.current = nextUid;
       setCurrentUser(user);
-      setCurrentView(user?.role === 'admin' || user?.role === 'master_admin' ? 'admin' : 'home');
+      if (authChanged) {
+        setCurrentView(user?.role === 'admin' || user?.role === 'master_admin' ? 'admin' : 'home');
+      } else if (!user) {
+        setCurrentView((prev) => (prev === 'admin' ? 'home' : prev));
+      }
       setAuthReady(true);
     });
 
@@ -133,7 +143,17 @@ function AppContent() {
       unsubVideos();
       unsubPdfs();
     };
-  }, [currentUser?.uid]);
+  }, [
+    currentUser?.uid,
+    currentUser?.role,
+    currentUser?.hasAllAccess,
+    JSON.stringify(currentUser?.allowedCategories || []),
+    JSON.stringify(currentUser?.assignedCourses || []),
+    currentUser?.accessExpiry,
+    currentUser?.subscriptionStatus,
+    currentUser?.isSuspended,
+    currentUser?.accountStatus
+  ]);
 
   // Signed-out visitors (and students without an entitlement) still see the
   // lesson list and its count. Those rows come from the public catalog and
@@ -211,9 +231,8 @@ function AppContent() {
   };
 
   const hasAccessToCategory = (catId?: string): boolean => {
-    if (!catId) return !!currentUser?.hasAllAccess;
-    if (currentUser?.hasAllAccess || currentUser?.role === 'master_admin' || currentUser?.role === 'admin') return true;
-    return !!currentUser?.allowedCategories?.includes(catId);
+    if (!catId) return hasCourseAccess(currentUser);
+    return hasCourseAccess(currentUser, catId);
   };
 
   if (!authReady) {

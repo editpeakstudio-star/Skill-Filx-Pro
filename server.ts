@@ -42,7 +42,7 @@ const isProduction = process.env.NODE_ENV === 'production';
 async function requireAdminContext(
   req: Request,
   res: Response,
-  requiredPermission: 'telegram.manage' | 'payments.verify' = 'telegram.manage'
+  requiredPermission: 'telegram.manage' | 'payments.verify' | 'students.manage' = 'telegram.manage'
 ) {
   const token = extractBearerToken(req.headers.authorization);
   if (!token) {
@@ -487,6 +487,178 @@ export function createApp() {
       res.json(outcome);
     } catch (err) {
       res.status(400).json({ error: sanitizeErrorMessage((err as Error).message) });
+    }
+  });
+
+  // ======================================================
+  // ADMIN USER SYNC BACKFILL (Firebase Auth -> Firestore)
+  // ======================================================
+  app.post('/api/admin/sync-users', async (req: Request, res: Response) => {
+    const admin = await requireAdminContext(req, res, 'students.manage');
+    if (!admin) return;
+
+    const clientEmail = (process.env.FIREBASE_CLIENT_EMAIL || '').trim();
+    const privateKeyRaw = (process.env.FIREBASE_PRIVATE_KEY || '').trim().replace(/\\n/g, '\n');
+    const projectId = (process.env.FIREBASE_PROJECT_ID || 'skillflix-academy').trim();
+
+    if (!clientEmail || !privateKeyRaw) {
+      res.status(400).json({
+        error:
+          'Service account credentials (FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY) are not set on the API server to list legacy Auth users.'
+      });
+      return;
+    }
+
+    try {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const b64u = (v: string | Buffer) =>
+        Buffer.from(v).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      const header = b64u(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+      const claims = b64u(
+        JSON.stringify({
+          iss: clientEmail,
+          sub: clientEmail,
+          aud: 'https://oauth2.googleapis.com/token',
+          scope: 'https://www.googleapis.com/auth/cloud-platform',
+          iat: nowSec,
+          exp: nowSec + 3600
+        })
+      );
+      const signer = crypto.createSign('RSA-SHA256');
+      signer.update(`${header}.${claims}`);
+      signer.end();
+      const sig = b64u(signer.sign(privateKeyRaw));
+
+      const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+          assertion: `${header}.${claims}.${sig}`
+        }).toString()
+      });
+      const tokenJson = (await tokenRes.json()) as { access_token?: string; error_description?: string };
+      if (!tokenRes.ok || !tokenJson.access_token) {
+        throw new Error(tokenJson.error_description || 'Failed to obtain Google OAuth access token.');
+      }
+
+      const authToken = tokenJson.access_token;
+      const authUsers: Array<{
+        localId?: string;
+        email?: string;
+        displayName?: string;
+        photoUrl?: string;
+        phoneNumber?: string;
+        createdAt?: string;
+        lastLoginAt?: string;
+        disabled?: boolean;
+        providerUserInfo?: Array<{ providerId?: string }>;
+      }> = [];
+
+      let nextPageToken = '';
+      for (let i = 0; i < 20; i++) {
+        const listUrl = new URL(
+          `https://identitytoolkit.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/accounts:batchGet`
+        );
+        listUrl.searchParams.set('maxResults', '500');
+        if (nextPageToken) listUrl.searchParams.set('nextPageToken', nextPageToken);
+        const uRes = await fetch(listUrl.toString(), {
+          headers: { Authorization: `Bearer ${authToken}`, Accept: 'application/json' }
+        });
+        if (!uRes.ok) {
+          throw new Error(`Identity Toolkit batchGet failed (${uRes.status})`);
+        }
+        const uJson = (await uRes.json()) as { users?: typeof authUsers; nextPageToken?: string };
+        if (Array.isArray(uJson.users)) authUsers.push(...uJson.users);
+        if (!uJson.nextPageToken) break;
+        nextPageToken = uJson.nextPageToken;
+      }
+
+      const existingIds = new Set<string>();
+      const fsBase = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/(default)/documents/users`;
+      let fsPageToken = '';
+      for (let i = 0; i < 10; i++) {
+        const fUrl = new URL(fsBase);
+        fUrl.searchParams.set('pageSize', '200');
+        if (fsPageToken) fUrl.searchParams.set('pageToken', fsPageToken);
+        const fRes = await fetch(fUrl.toString(), {
+          headers: { Authorization: `Bearer ${authToken}`, Accept: 'application/json' }
+        });
+        if (!fRes.ok) break;
+        const fJson = (await fRes.json()) as {
+          documents?: Array<{ name?: string }>;
+          nextPageToken?: string;
+        };
+        for (const d of fJson.documents || []) {
+          const id = d.name?.split('/').pop();
+          if (id) existingIds.add(id);
+        }
+        if (!fJson.nextPageToken) break;
+        fsPageToken = fJson.nextPageToken;
+      }
+
+      let syncedCount = 0;
+      const nowIso = new Date().toISOString();
+      for (const u of authUsers) {
+        const uid = (u.localId || '').trim();
+        if (!uid || existingIds.has(uid)) continue;
+        const email = (u.email || '').trim().toLowerCase();
+        const isOwner = email === 'editpeakstudio@gmail.com';
+        const createdIso = u.createdAt ? new Date(Number(u.createdAt)).toISOString() : nowIso;
+        const lastLoginIso = u.lastLoginAt ? new Date(Number(u.lastLoginAt)).toISOString() : createdIso;
+        const ids = (u.providerUserInfo || []).map(p => (p.providerId || '').toLowerCase());
+        const provider = ids.includes('google.com')
+          ? 'google'
+          : ids.includes('phone')
+            ? 'phone'
+            : ids.includes('password')
+              ? 'password'
+              : ids[0] || 'other';
+        const displayName =
+          (u.displayName || '').trim() || (email ? email.split('@')[0] : '') || u.phoneNumber || 'Student';
+        const suspended = u.disabled === true && !isOwner;
+
+        const createRes = await fetch(`${fsBase}/${encodeURIComponent(uid)}?currentDocument.exists=false`, {
+          method: 'PATCH',
+          headers: {
+            Authorization: `Bearer ${authToken}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            fields: {
+              uid: { stringValue: uid },
+              email: { stringValue: email },
+              displayName: { stringValue: displayName },
+              photoURL: { stringValue: u.photoUrl || '' },
+              phoneNumber: { stringValue: u.phoneNumber || '' },
+              authProvider: { stringValue: provider },
+              role: { stringValue: isOwner ? 'master_admin' : 'user' },
+              hasAllAccess: { booleanValue: isOwner },
+              allowedCategories: { arrayValue: { values: [] } },
+              assignedCourses: { arrayValue: { values: [] } },
+              subscriptionStatus: { stringValue: 'none' },
+              accessExpiry: { nullValue: null },
+              accountStatus: { stringValue: suspended ? 'suspended' : 'active' },
+              isSuspended: { booleanValue: suspended },
+              createdAt: { stringValue: createdIso },
+              lastLogin: { stringValue: lastLoginIso },
+              lastLoginAt: { stringValue: lastLoginIso }
+            }
+          })
+        });
+        if (createRes.ok) {
+          syncedCount++;
+          existingIds.add(uid);
+        }
+      }
+
+      res.json({
+        syncedCount,
+        totalAuthUsers: authUsers.length,
+        alreadySyncedCount: Math.max(0, authUsers.length - syncedCount)
+      });
+    } catch (err) {
+      res.status(500).json({ error: sanitizeErrorMessage((err as Error).message) });
     }
   });
 

@@ -22,6 +22,7 @@ import {
   collection,
   doc,
   getDoc,
+  getDocFromServer,
   setDoc,
   getDocs,
   updateDoc,
@@ -30,7 +31,8 @@ import {
   onSnapshot,
   query,
   orderBy,
-  where
+  where,
+  Timestamp
 } from 'firebase/firestore';
 import { 
   UserProfile, 
@@ -64,10 +66,77 @@ const firebaseConfig = {
   measurementId: "G-J64YDWND5C"
 };
 
+export enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+export interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId: string | undefined;
+    email: string | null | undefined;
+    emailVerified: boolean | undefined;
+    isAnonymous: boolean | undefined;
+    tenantId: string | null | undefined;
+    providerInfo: {
+      providerId: string;
+      displayName: string | null;
+      email: string | null;
+      photoUrl: string | null;
+    }[];
+  };
+}
+
+export function handleFirestoreError(
+  error: unknown,
+  operationType: OperationType,
+  path: string | null
+): never {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth?.currentUser?.uid,
+      email: auth?.currentUser?.email,
+      emailVerified: auth?.currentUser?.emailVerified,
+      isAnonymous: auth?.currentUser?.isAnonymous,
+      tenantId: auth?.currentUser?.tenantId,
+      providerInfo:
+        auth?.currentUser?.providerData?.map((provider: any) => ({
+          providerId: provider.providerId,
+          displayName: provider.displayName,
+          email: provider.email,
+          photoUrl: provider.photoURL
+        })) || []
+    },
+    operationType,
+    path
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw firebaseAuthMessage(error, `Firestore ${operationType} failed for ${path || 'unknown path'}.`);
+}
+
 let app: any = null;
 let auth: any = null;
 let db: any = null;
 let isFirebaseOnline = false;
+
+async function testFirestoreConnection() {
+  if (!db) return;
+  try {
+    await getDocFromServer(doc(db, 'test', 'connection'));
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('the client is offline')) {
+      console.error('Please check your Firebase configuration. Firestore client is offline.');
+    }
+  }
+}
 
 try {
   app = getApps().some(existingApp => existingApp.name === '[DEFAULT]')
@@ -79,6 +148,7 @@ try {
   });
   db = getFirestore(app);
   isFirebaseOnline = true;
+  void testFirestoreConnection();
 } catch (err) {
   console.warn('Firebase initialization note (using resilient fallback store):', err);
   isFirebaseOnline = false;
@@ -413,54 +483,264 @@ export function hasPermission(user: UserProfile | null, permission: PermissionKe
 }
 
 // ==========================================
-// AUTHENTICATION SERVICES
+// AUTHENTICATION & ENTITLEMENT HELPERS
 // ==========================================
 
-async function loadAuthenticatedProfile(fbUser: FirebaseUser): Promise<UserProfile> {
-  if (!db) throw new Error('Firebase Firestore is unavailable. Check the Firebase project configuration.');
-  const isOwner = fbUser.emailVerified === true &&
-    fbUser.email?.trim().toLowerCase() === PLATFORM_OWNER_EMAIL;
-  const profileRef = doc(db, 'users', fbUser.uid);
-  const remote = await getDoc(profileRef);
-  const data = remote.exists() ? remote.data() : {};
-  const role: UserRole = isOwner ? 'master_admin' : (data.role === 'admin' || data.role === 'master_admin' ? data.role : 'user');
-  const profile: UserProfile = {
-    uid: fbUser.uid,
-    email: fbUser.email || '',
-    displayName: data.displayName || fbUser.displayName || fbUser.phoneNumber || fbUser.email?.split('@')[0] || 'Student',
-    photoURL: fbUser.photoURL || data.photoURL || undefined,
-    phoneNumber: fbUser.phoneNumber || data.phoneNumber || undefined,
+export function resolveAuthProvider(fbUser?: FirebaseUser | null, existingProvider?: string): string {
+  const providerId = fbUser?.providerData?.[0]?.providerId;
+  if (providerId === 'google.com') return 'google';
+  if (providerId === 'password') return 'password';
+  if (providerId === 'phone') return 'phone';
+  if (providerId) return providerId;
+  return existingProvider || 'email/password';
+}
+
+function toIsoDateValue(value: unknown): string | undefined {
+  if (!value) return undefined;
+  if (typeof value === 'string') return value;
+  if (value instanceof Date) return value.toISOString();
+  if (typeof (value as any)?.toDate === 'function') {
+    try {
+      return (value as any).toDate().toISOString();
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+export function isUserAccessExpired(user?: UserProfile | null): boolean {
+  if (!user) return false;
+  if (isProtectedOwner(user)) return false;
+  if (user.subscriptionStatus === 'expired') return true;
+  if (!user.accessExpiry) return false;
+  const expiryMs = new Date(user.accessExpiry).getTime();
+  if (Number.isNaN(expiryMs)) return false;
+  return expiryMs <= Date.now();
+}
+
+export function isUserAccessActive(user?: UserProfile | null): boolean {
+  if (!user) return false;
+  if (isProtectedOwner(user)) return true;
+  if (user.isSuspended || user.accountStatus === 'suspended') return false;
+  if (isUserAccessExpired(user)) return false;
+  if (user.role === 'master_admin' || user.role === 'admin') return true;
+  const assignedCount = (user.allowedCategories?.length || 0) + (user.assignedCourses?.length || 0);
+  return user.hasAllAccess === true || assignedCount > 0;
+}
+
+export function hasCourseAccess(user: UserProfile | null | undefined, categoryId?: string): boolean {
+  if (!user) return false;
+  if (isProtectedOwner(user)) return true;
+  if (user.isSuspended || user.accountStatus === 'suspended') return false;
+  if (user.role === 'master_admin' || user.role === 'admin') return true;
+  if (isUserAccessExpired(user)) return false;
+  if (user.hasAllAccess) return true;
+  if (!categoryId) return false;
+  return Boolean(
+    user.allowedCategories?.includes(categoryId) ||
+    user.assignedCourses?.includes(categoryId)
+  );
+}
+
+function normalizeUserProfile(
+  uid: string,
+  rawData: Record<string, any>,
+  fbUser?: FirebaseUser | null
+): UserProfile {
+  const email = String(rawData.email || fbUser?.email || '').trim();
+  const isOwner =
+    rawData.isPlatformOwner === true ||
+    (!!fbUser &&
+      fbUser.emailVerified === true &&
+      fbUser.email?.trim().toLowerCase() === PLATFORM_OWNER_EMAIL);
+  const role: UserRole = isOwner
+    ? 'master_admin'
+    : rawData.role === 'admin' || rawData.role === 'master_admin'
+      ? rawData.role
+      : 'user';
+  const suspended = isOwner ? false : (rawData.isSuspended === true || rawData.accountStatus === 'suspended');
+  const mergedCourses = Array.from(
+    new Set([
+      ...(Array.isArray(rawData.allowedCategories) ? rawData.allowedCategories : []),
+      ...(Array.isArray(rawData.assignedCourses) ? rawData.assignedCourses : [])
+    ].filter((v): v is string => typeof v === 'string' && v.trim().length > 0))
+  );
+  const createdAt = toIsoDateValue(rawData.createdAt) || fbUser?.metadata?.creationTime || new Date().toISOString();
+  const lastLoginAt =
+    toIsoDateValue(rawData.lastLoginAt) ||
+    toIsoDateValue(rawData.lastLogin) ||
+    fbUser?.metadata?.lastSignInTime ||
+    createdAt;
+  const accessExpiry = rawData.accessExpiry === null
+    ? null
+    : toIsoDateValue(rawData.accessExpiry) ?? toIsoDateValue(rawData.accessExpiryAt) ?? null;
+
+  return {
+    uid,
+    email,
+    displayName:
+      String(
+        rawData.displayName ||
+          fbUser?.displayName ||
+          fbUser?.phoneNumber ||
+          email.split('@')[0] ||
+          'Student'
+      ).trim() || 'Student',
+    photoURL: fbUser?.photoURL || rawData.photoURL || undefined,
+    phoneNumber: fbUser?.phoneNumber || rawData.phoneNumber || undefined,
+    authProvider: resolveAuthProvider(fbUser, rawData.authProvider),
     role,
     isPlatformOwner: isOwner,
-    predefinedRole: isOwner ? 'owner' : data.predefinedRole,
-    assignedRoleTitle: isOwner ? 'Platform Owner' : data.assignedRoleTitle,
-    permissions: isOwner ? SYSTEM_PERMISSIONS.map(p => p.key) : Array.isArray(data.permissions) ? data.permissions : [],
-    isSuspended: isOwner ? false : data.isSuspended === true,
-    hasAllAccess: isOwner || data.hasAllAccess === true,
-    allowedCategories: Array.isArray(data.allowedCategories) ? data.allowedCategories : [],
-    allowedFolders: Array.isArray(data.allowedFolders) ? data.allowedFolders : [],
-    subscriptionStatus: isOwner ? 'active' : data.subscriptionStatus || 'none',
-    accessExpiry: data.accessExpiry,
-    lastLogin: new Date().toISOString(),
-    createdAt: data.createdAt || new Date().toISOString()
+    predefinedRole: isOwner ? 'owner' : rawData.predefinedRole,
+    assignedRoleTitle: isOwner ? 'Platform Owner' : rawData.assignedRoleTitle,
+    permissions: isOwner
+      ? SYSTEM_PERMISSIONS.map(p => p.key)
+      : Array.isArray(rawData.permissions)
+        ? rawData.permissions
+        : [],
+    isSuspended: suspended,
+    accountStatus: suspended ? 'suspended' : 'active',
+    hasAllAccess: isOwner || rawData.hasAllAccess === true,
+    allowedCategories: mergedCourses,
+    assignedCourses: mergedCourses,
+    allowedFolders: Array.isArray(rawData.allowedFolders) ? rawData.allowedFolders : [],
+    subscriptionStatus: isOwner
+      ? 'active'
+      : rawData.subscriptionStatus || (mergedCourses.length > 0 || rawData.hasAllAccess === true ? 'active' : 'none'),
+    accessExpiry,
+    lastLogin: lastLoginAt,
+    lastLoginAt,
+    createdAt
   };
+}
 
-  if (!remote.exists()) {
-    const { uid: _uid, ...newDoc } = profile;
-    await setDoc(profileRef, Object.fromEntries(Object.entries(newDoc).filter(([, value]) => value !== undefined)));
-  } else if (data.displayName !== profile.displayName || data.photoURL !== profile.photoURL || (isOwner && data.isPlatformOwner !== true)) {
-    await setDoc(profileRef, {
-      ...(data.displayName !== profile.displayName ? { displayName: profile.displayName } : {}),
-      ...(data.photoURL !== profile.photoURL ? { photoURL: profile.photoURL || null } : {}),
-      ...(isOwner ? { isPlatformOwner: true } : {})
-    }, { merge: true });
+const pendingRegistrationNames = new Map<string, string>();
+const inFlightProfileLoads = new Map<string, Promise<UserProfile>>();
+
+async function loadAuthenticatedProfile(
+  fbUser: FirebaseUser,
+  options: { updateLastLogin?: boolean; explicitDisplayName?: string } = {}
+): Promise<UserProfile> {
+  if (!db) throw new Error('Firebase Firestore is unavailable. Check the Firebase project configuration.');
+  const loadKey = `${fbUser.uid}:${options.updateLastLogin ? 'login' : 'sync'}`;
+  const existingLoad = inFlightProfileLoads.get(loadKey);
+  if (existingLoad && !options.explicitDisplayName) {
+    return existingLoad;
   }
 
-  const cached = readStorage<Record<string, UserProfile>>(STORAGE_KEYS.USERS, {});
-  cached[fbUser.uid] = profile;
-  writeStorage(STORAGE_KEYS.USERS, cached);
-  writeStorage(STORAGE_KEYS.CURRENT_USER, profile);
-  return profile;
+  const run = (async () => {
+    const cleanEmail = (fbUser.email || '').trim().toLowerCase();
+    const isOwner = fbUser.emailVerified === true && cleanEmail === PLATFORM_OWNER_EMAIL;
+    const profileRef = doc(db, 'users', fbUser.uid);
+    const remote = await getDoc(profileRef);
+    const data = remote.exists() ? remote.data() : {};
+    const nowIso = new Date().toISOString();
+    const pendingName = cleanEmail ? pendingRegistrationNames.get(cleanEmail) : undefined;
+    const resolvedName = (
+      options.explicitDisplayName ||
+      pendingName ||
+      data.displayName ||
+      fbUser.displayName ||
+      fbUser.phoneNumber ||
+      fbUser.email?.split('@')[0] ||
+      'Student'
+    ).trim();
+
+    const authProvider = resolveAuthProvider(fbUser, data.authProvider);
+    const role: UserRole = isOwner
+      ? 'master_admin'
+      : (data.role === 'admin' || data.role === 'master_admin' ? data.role : 'user');
+    const mergedCourses = Array.from(
+      new Set([
+        ...(Array.isArray(data.allowedCategories) ? data.allowedCategories : []),
+        ...(Array.isArray(data.assignedCourses) ? data.assignedCourses : [])
+      ].filter((v): v is string => typeof v === 'string' && v.trim().length > 0))
+    );
+    const suspended = isOwner ? false : (data.isSuspended === true || data.accountStatus === 'suspended');
+    const lastLoginIso = (options.updateLastLogin || !remote.exists())
+      ? nowIso
+      : (data.lastLoginAt || data.lastLogin || nowIso);
+
+    const profile: UserProfile = {
+      uid: fbUser.uid,
+      email: data.email || fbUser.email || '',
+      displayName: resolvedName,
+      photoURL: fbUser.photoURL || data.photoURL || undefined,
+      phoneNumber: fbUser.phoneNumber || data.phoneNumber || undefined,
+      authProvider,
+      role,
+      isPlatformOwner: isOwner,
+      predefinedRole: isOwner ? 'owner' : data.predefinedRole,
+      assignedRoleTitle: isOwner ? 'Platform Owner' : data.assignedRoleTitle,
+      permissions: isOwner ? SYSTEM_PERMISSIONS.map(p => p.key) : Array.isArray(data.permissions) ? data.permissions : [],
+      isSuspended: suspended,
+      accountStatus: suspended ? 'suspended' : 'active',
+      hasAllAccess: isOwner || data.hasAllAccess === true,
+      allowedCategories: mergedCourses,
+      assignedCourses: mergedCourses,
+      allowedFolders: Array.isArray(data.allowedFolders) ? data.allowedFolders : [],
+      subscriptionStatus: isOwner ? 'active' : data.subscriptionStatus || 'none',
+      accessExpiry: data.accessExpiry ?? null,
+      lastLogin: lastLoginIso,
+      lastLoginAt: lastLoginIso,
+      createdAt: data.createdAt || fbUser.metadata?.creationTime || nowIso
+    };
+
+    if (!remote.exists()) {
+      const cleanDoc = Object.fromEntries(
+        Object.entries({
+          ...profile,
+          accessExpiryAt: null
+        }).filter(([, value]) => value !== undefined)
+      );
+      await setDoc(profileRef, cleanDoc);
+    } else {
+      const updatePayload: Record<string, any> = {};
+      if (data.uid !== fbUser.uid) updatePayload.uid = fbUser.uid;
+      if (resolvedName && data.displayName !== resolvedName && (!data.displayName || data.displayName === 'Student' || options.explicitDisplayName)) {
+        updatePayload.displayName = resolvedName;
+      }
+      if ((fbUser.photoURL || null) !== (data.photoURL ?? null) && fbUser.photoURL) {
+        updatePayload.photoURL = fbUser.photoURL;
+      }
+      if ((fbUser.phoneNumber || null) !== (data.phoneNumber ?? null) && fbUser.phoneNumber) {
+        updatePayload.phoneNumber = fbUser.phoneNumber;
+      }
+      if (data.authProvider !== authProvider) {
+        updatePayload.authProvider = authProvider;
+      }
+      if (options.updateLastLogin || !data.lastLoginAt || !data.lastLogin) {
+        updatePayload.lastLogin = nowIso;
+        updatePayload.lastLoginAt = nowIso;
+      }
+      if (isOwner) {
+        if (data.isPlatformOwner !== true) updatePayload.isPlatformOwner = true;
+        if (data.role !== 'master_admin') updatePayload.role = 'master_admin';
+        if (data.hasAllAccess !== true) updatePayload.hasAllAccess = true;
+        if (data.subscriptionStatus !== 'active') updatePayload.subscriptionStatus = 'active';
+        if (data.accountStatus !== 'active') updatePayload.accountStatus = 'active';
+        if (data.isSuspended !== false) updatePayload.isSuspended = false;
+      }
+
+      if (Object.keys(updatePayload).length > 0) {
+        await updateDoc(profileRef, updatePayload);
+      }
+    }
+
+    const cached = readStorage<Record<string, UserProfile>>(STORAGE_KEYS.USERS, {});
+    cached[fbUser.uid] = profile;
+    writeStorage(STORAGE_KEYS.USERS, cached);
+    writeStorage(STORAGE_KEYS.CURRENT_USER, profile);
+    return profile;
+  })();
+
+  inFlightProfileLoads.set(loadKey, run);
+  try {
+    return await run;
+  } finally {
+    inFlightProfileLoads.delete(loadKey);
+  }
 }
 
 export async function getCurrentUserProfile(): Promise<UserProfile | null> {
@@ -473,33 +753,71 @@ export function subscribeToAuth(callback: (user: UserProfile | null) => void): (
     callback(user);
   });
 
-  // Also hook into live Firebase auth if active
+  // Also hook into live Firebase auth + live user document snapshot
   let unsubFb: (() => void) | null = null;
+  let unsubUserDoc: (() => void) | null = null;
+  let recordedLoginForUid: string | null = null;
+
   if (auth) {
     try {
       unsubFb = fbOnAuthStateChanged(auth, async (fbUser: FirebaseUser | null) => {
+        if (unsubUserDoc) {
+          unsubUserDoc();
+          unsubUserDoc = null;
+        }
+
         if (fbUser) {
           try {
-            // A verified owner can return to an existing persisted session after
-            // clicking the verification link. Refresh the Firebase user and its
-            // signed token before deriving any client-side role from emailVerified.
-            // Firestore Rules still independently authorize privileged requests.
+            // Refresh the Firebase user and its signed token before deriving role from emailVerified.
             try {
               await fbUser.reload();
               await fbUser.getIdToken(true);
             } catch (refreshError) {
               console.warn('Could not refresh the Firebase Auth session:', refreshError);
             }
-            const profile = await loadAuthenticatedProfile(fbUser);
+
+            const shouldUpdateLogin = recordedLoginForUid !== fbUser.uid;
+            recordedLoginForUid = fbUser.uid;
+
+            const profile = await loadAuthenticatedProfile(fbUser, {
+              updateLastLogin: shouldUpdateLogin
+            });
+
             if (profile && (profile.role === 'admin' || profile.role === 'master_admin')) {
               void purgeUnwantedRecordsFromFirestore();
             }
             callback(profile);
+
+            // Real-time listener on users/{uid} so manual access grants, payment approvals,
+            // role changes, or suspensions apply immediately without page reload.
+            if (db) {
+              unsubUserDoc = onSnapshot(
+                doc(db, 'users', fbUser.uid),
+                (snap) => {
+                  if (!snap.exists()) {
+                    void loadAuthenticatedProfile(fbUser, { updateLastLogin: false })
+                      .then((created) => callback(created))
+                      .catch(() => {});
+                    return;
+                  }
+                  const liveProfile = normalizeUserProfile(fbUser.uid, snap.data(), fbUser);
+                  const cachedUsers = readStorage<Record<string, UserProfile>>(STORAGE_KEYS.USERS, {});
+                  cachedUsers[fbUser.uid] = liveProfile;
+                  writeStorage(STORAGE_KEYS.USERS, cachedUsers);
+                  writeStorage(STORAGE_KEYS.CURRENT_USER, liveProfile);
+                  callback(liveProfile);
+                },
+                (err) => {
+                  console.warn('Live user profile snapshot warning:', err.message);
+                }
+              );
+            }
           } catch (err) {
             console.error('Could not load the signed-in profile:', err);
             callback(null);
           }
         } else {
+          recordedLoginForUid = null;
           writeStorage(STORAGE_KEYS.CURRENT_USER, null);
           callback(null);
         }
@@ -511,6 +829,7 @@ export function subscribeToAuth(callback: (user: UserProfile | null) => void): (
 
   return () => {
     unsubStorage();
+    if (unsubUserDoc) unsubUserDoc();
     if (unsubFb) unsubFb();
   };
 }
@@ -522,7 +841,7 @@ export async function loginWithGoogle(): Promise<UserProfile> {
     const provider = new GoogleAuthProvider();
     provider.setCustomParameters({ prompt: 'select_account' });
     const result = await signInWithPopup(auth, provider);
-    const profile = await loadAuthenticatedProfile(result.user);
+    const profile = await loadAuthenticatedProfile(result.user, { updateLastLogin: true });
     if (result.user.email?.trim().toLowerCase() === PLATFORM_OWNER_EMAIL && !result.user.emailVerified) {
       try {
         await fbSendEmailVerification(result.user);
@@ -590,7 +909,7 @@ export async function sendPhoneOtp(phoneNumber: string, appVerifier: any): Promi
 export async function verifyPhoneOtp(confirmationResult: ConfirmationResult, code: string): Promise<UserProfile> {
   try {
     const credential = await confirmationResult.confirm(code);
-    const profile = await loadAuthenticatedProfile(credential.user);
+    const profile = await loadAuthenticatedProfile(credential.user, { updateLastLogin: true });
     eventBus.emit('auth', profile);
     return profile;
   } catch (err: any) {
@@ -649,7 +968,7 @@ export async function loginUser(email: string, pass: string): Promise<UserProfil
   if (!pass || pass.length < 6) throw new Error('Password must be at least 6 characters long.');
   try {
     const credential = await fbSignInWithEmail(auth, email.trim().toLowerCase(), pass);
-    const profile = await loadAuthenticatedProfile(credential.user);
+    const profile = await loadAuthenticatedProfile(credential.user, { updateLastLogin: true });
     if (credential.user.email?.trim().toLowerCase() === PLATFORM_OWNER_EMAIL && !credential.user.emailVerified) {
       try {
         await fbSendEmailVerification(credential.user);
@@ -674,10 +993,15 @@ export async function registerUser(email: string, pass: string, name: string): P
   if (!cleanEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) throw new Error('Enter a valid email address.');
   if (cleanName.length < 2) throw new Error('Enter your name (at least 2 characters).');
   if (pass.length < 6) throw new Error('Choose a password with at least 6 characters.');
+
+  pendingRegistrationNames.set(cleanEmail, cleanName);
   try {
     const credential = await fbCreateUserWithEmail(auth, cleanEmail, pass);
     await updateProfile(credential.user, { displayName: cleanName });
-    const profile = await loadAuthenticatedProfile(credential.user);
+    const profile = await loadAuthenticatedProfile(credential.user, {
+      updateLastLogin: true,
+      explicitDisplayName: cleanName
+    });
     if (cleanEmail === PLATFORM_OWNER_EMAIL && !credential.user.emailVerified) {
       try {
         await fbSendEmailVerification(credential.user);
@@ -692,6 +1016,8 @@ export async function registerUser(email: string, pass: string, name: string): P
     return profile;
   } catch (err: any) {
     throw firebaseAuthMessage(err, 'Could not create your account. Please try again.');
+  } finally {
+    pendingRegistrationNames.delete(cleanEmail);
   }
 }
 
@@ -1373,15 +1699,25 @@ export function subscribeToVideos(callback: (videos: VideoLesson[]) => void, inc
     const results: Record<number, Record<string, VideoLesson>> = {};
     void getDoc(doc(db, 'users', auth?.currentUser?.uid || '')).then((userSnap) => {
       if (cancelled) return;
-      const user = userSnap.exists() ? userSnap.data() : {};
+      const userData = userSnap.exists() ? userSnap.data() : {};
+      const normalized = normalizeUserProfile(auth?.currentUser?.uid || '', userData, auth?.currentUser);
+      const isSuspendedOrExpired = normalized.isSuspended || isUserAccessExpired(normalized);
+      const unlockedIds = Array.from(
+        new Set([...(normalized.allowedCategories || []), ...(normalized.assignedCourses || [])])
+      );
       const base = collection(db, 'videos');
       const queries = includeUnpublished
         ? [base]
-        : user.hasAllAccess === true
-          ? [query(base, where('isPublished', '==', true))]
-          : [query(base, where('isPublished', '==', true), where('isFreePreview', '==', true)),
-             ...((Array.isArray(user.allowedCategories) ? user.allowedCategories : []).map((id: string) =>
-               query(base, where('isPublished', '==', true), where('categoryId', '==', id))))];
+        : isSuspendedOrExpired
+          ? [query(base, where('isPublished', '==', true), where('isFreePreview', '==', true))]
+          : normalized.hasAllAccess
+            ? [query(base, where('isPublished', '==', true))]
+            : [
+                query(base, where('isPublished', '==', true), where('isFreePreview', '==', true)),
+                ...unlockedIds.map((id: string) =>
+                  query(base, where('isPublished', '==', true), where('categoryId', '==', id))
+                )
+              ];
       queries.forEach((videosQuery, index) => {
         listeners.push(onSnapshot(videosQuery, (snapshot) => {
           results[index] = {};
@@ -1659,14 +1995,25 @@ export function subscribeToPdfs(callback: (pdfs: PdfResource[]) => void, include
     const results: Record<number, Record<string, PdfResource>> = {};
     void getDoc(doc(db, 'users', auth?.currentUser?.uid || '')).then((userSnap) => {
       if (cancelled) return;
-      const user = userSnap.exists() ? userSnap.data() : {};
+      const userData = userSnap.exists() ? userSnap.data() : {};
+      const normalized = normalizeUserProfile(auth?.currentUser?.uid || '', userData, auth?.currentUser);
+      const isSuspendedOrExpired = normalized.isSuspended || isUserAccessExpired(normalized);
+      const unlockedIds = Array.from(
+        new Set([...(normalized.allowedCategories || []), ...(normalized.assignedCourses || [])])
+      );
       const base = collection(db, 'pdfs');
       const queries = includeUnpublished
         ? [base]
-        : user.hasAllAccess === true
-          ? [query(base, where('isPublished', '==', true))]
-          : (Array.isArray(user.allowedCategories) ? user.allowedCategories : []).map((id: string) =>
-              query(base, where('isPublished', '==', true), where('categoryId', '==', id)));
+        : isSuspendedOrExpired
+          ? []
+          : normalized.hasAllAccess
+            ? [query(base, where('isPublished', '==', true))]
+            : unlockedIds.map((id: string) =>
+                query(base, where('isPublished', '==', true), where('categoryId', '==', id))
+              );
+      if (queries.length === 0) {
+        callback([]);
+      }
       queries.forEach((pdfsQuery, index) => {
         listeners.push(onSnapshot(pdfsQuery, (snapshot) => {
           results[index] = {};
@@ -1809,27 +2156,35 @@ export function subscribeToUsers(callback: (users: UserProfile[]) => void): () =
   // Never hydrate another user's private profile cache into an unauthenticated/demo session.
   callback([]);
   if (!db || !isFirebaseOnline || !auth?.currentUser) return () => {};
+
+  const unsubEvent = eventBus.subscribe<UserProfile[]>('users', callback);
   let unsub: (() => void) | undefined;
   let cancelled = false;
+
   void getDoc(doc(db, 'users', auth.currentUser.uid)).then((actor) => {
     if (cancelled) return;
     const data = actor.exists() ? actor.data() : {};
     const authorized = isCurrentAuthUserPlatformOwner() ||
       ((data.role === 'admin' || data.role === 'master_admin') && data.isSuspended !== true);
     if (!authorized) return;
+
     unsub = onSnapshot(collection(db, 'users'), (snapshot) => {
       const remote: UserProfile[] = [];
       snapshot.forEach(docSnap => {
-        // Firestore document ID is the authoritative user UID.
-        remote.push({ ...docSnap.data(), uid: docSnap.id } as UserProfile);
+        remote.push(normalizeUserProfile(docSnap.id, docSnap.data()));
       });
 
-      // Cache remote users by their actual Firestore document IDs.
-      const cached = readStorage<Record<string, UserProfile>>(STORAGE_KEYS.USERS, {});
-      remote.forEach(user => {
-        cached[user.uid] = user;
+      remote.sort((a, b) => {
+        if (isProtectedOwner(a) !== isProtectedOwner(b)) return isProtectedOwner(a) ? -1 : 1;
+        return new Date(b.lastLoginAt || b.lastLogin || b.createdAt).getTime() -
+               new Date(a.lastLoginAt || a.lastLogin || a.createdAt).getTime();
       });
-      writeStorage(STORAGE_KEYS.USERS, cached);
+
+      const cacheObj: Record<string, UserProfile> = {};
+      remote.forEach(user => {
+        cacheObj[user.uid] = user;
+      });
+      writeStorage(STORAGE_KEYS.USERS, cacheObj);
 
       callback(remote);
     }, (err) => {
@@ -1837,7 +2192,12 @@ export function subscribeToUsers(callback: (users: UserProfile[]) => void): () =
       callback([]);
     });
   }).catch((err) => console.warn('Could not authorize users list:', err));
-  return () => { cancelled = true; unsub?.(); };
+
+  return () => {
+    cancelled = true;
+    unsubEvent();
+    unsub?.();
+  };
 }
 
 // Update admin role and permissions with security checks
@@ -2039,6 +2399,263 @@ export async function removeAdminPrivileges(
   return target;
 }
 
+export interface ManualAccessGrantInput {
+  targetUid: string;
+  grantType: 'all_access' | 'categories';
+  categoryIds?: string[];
+  mergeWithExisting?: boolean;
+  durationType: 'permanent' | 'expiry';
+  durationDays?: number;
+  customExpiryIso?: string | null;
+  paymentRequestId?: string | null;
+  adminNote?: string;
+}
+
+export async function grantManualCourseAccess(
+  actor: UserProfile,
+  params: ManualAccessGrantInput
+): Promise<UserProfile> {
+  if (!db || !auth?.currentUser || auth.currentUser.uid !== actor.uid) {
+    throw new Error('A signed-in administrator and Firestore connection are required.');
+  }
+  if (actor.isSuspended) {
+    throw new Error('Action denied: Your administrative account is suspended.');
+  }
+  const canGrant =
+    isProtectedOwner(actor) ||
+    hasPermission(actor, 'students.manage') ||
+    hasPermission(actor, 'payments.verify');
+  if (!canGrant) {
+    throw new Error('Permission denied: You do not have permission to grant course access.');
+  }
+
+  const targetRef = doc(db, 'users', params.targetUid);
+  const targetSnap = await getDoc(targetRef);
+  if (!targetSnap.exists()) {
+    throw new Error('Target student profile was not found in Firestore. Run "Sync Auth Users" or ask the user to sign in first.');
+  }
+
+  const existing = normalizeUserProfile(targetSnap.id, targetSnap.data());
+  if (isProtectedOwner(existing)) {
+    throw new Error('Platform Owner already has permanent unrestricted access.');
+  }
+
+  let expiryIso: string | null = null;
+  let expiryTimestamp: Timestamp | null = null;
+  if (params.durationType === 'expiry') {
+    let expiryDate: Date;
+    if (params.customExpiryIso) {
+      const parsed = new Date(
+        /^\d{4}-\d{2}-\d{2}$/.test(params.customExpiryIso.trim())
+          ? `${params.customExpiryIso.trim()}T23:59:59.999Z`
+          : params.customExpiryIso
+      );
+      if (Number.isNaN(parsed.getTime()) || parsed.getTime() <= Date.now()) {
+        throw new Error('Choose a valid future expiration date.');
+      }
+      expiryDate = parsed;
+    } else {
+      const days = Math.max(1, Math.min(3650, Number(params.durationDays || 30)));
+      expiryDate = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+    }
+    expiryIso = expiryDate.toISOString();
+    expiryTimestamp = Timestamp.fromDate(expiryDate);
+  }
+
+  const prevCats = Array.from(
+    new Set([...(existing.allowedCategories || []), ...(existing.assignedCourses || [])])
+  );
+
+  let nextHasAllAccess = existing.hasAllAccess;
+  let nextAllowedCategories = [...prevCats];
+
+  if (params.grantType === 'all_access') {
+    nextHasAllAccess = true;
+    if (Array.isArray(params.categoryIds) && params.categoryIds.length > 0) {
+      nextAllowedCategories = Array.from(new Set([...prevCats, ...params.categoryIds]));
+    }
+  } else {
+    const selected = Array.from(new Set((params.categoryIds || []).filter(Boolean)));
+    if (selected.length === 0) {
+      throw new Error('Select at least one course to grant access.');
+    }
+    nextAllowedCategories =
+      params.mergeWithExisting !== false
+        ? Array.from(new Set([...prevCats, ...selected]))
+        : selected;
+    if (params.mergeWithExisting === false) {
+      nextHasAllAccess = false;
+    }
+  }
+
+  const nowIso = new Date().toISOString();
+  const batch = writeBatch(db);
+  batch.update(targetRef, {
+    hasAllAccess: nextHasAllAccess,
+    allowedCategories: nextAllowedCategories,
+    assignedCourses: nextAllowedCategories,
+    subscriptionStatus: 'active',
+    accessExpiry: expiryIso,
+    accessExpiryAt: expiryTimestamp
+  });
+
+  let updatedPayment: PaymentRequest | undefined;
+  let sale: SalesRecord | undefined;
+
+  if (params.paymentRequestId) {
+    const canVerifyPay = isProtectedOwner(actor) || hasPermission(actor, 'payments.verify');
+    if (!canVerifyPay) {
+      throw new Error('You do not have permission to approve payment requests.');
+    }
+    const reqRef = doc(db, 'paymentRequests', params.paymentRequestId);
+    const reqSnap = await getDoc(reqRef);
+    if (reqSnap.exists()) {
+      const reqData = { id: reqSnap.id, ...reqSnap.data() } as PaymentRequest;
+      if (reqData.status === 'pending') {
+        const note = (params.adminNote || 'Manually verified & course access granted').trim();
+        batch.update(reqRef, {
+          status: 'approved',
+          adminNote: note,
+          resolvedAt: nowIso,
+          resolvedBy: actor.email || ''
+        });
+        updatedPayment = {
+          ...reqData,
+          status: 'approved',
+          adminNote: note,
+          resolvedAt: nowIso,
+          resolvedBy: actor.email || ''
+        };
+        const saleId = `sale_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+        sale = {
+          id: saleId,
+          requestId: reqData.id,
+          amount: reqData.amount,
+          userEmail: reqData.userEmail,
+          planType: reqData.planType === 'all_access' ? 'All-Access Pass' : (reqData.categoryName || 'Category Pass'),
+          categoryName: reqData.categoryName,
+          date: nowIso
+        };
+        batch.set(doc(db, 'sales_analytics', saleId), sale);
+      }
+    }
+  }
+
+  try {
+    await batch.commit();
+  } catch (err: any) {
+    handleFirestoreError(err, OperationType.UPDATE, `users/${params.targetUid}`);
+  }
+
+  const updatedProfile: UserProfile = {
+    ...existing,
+    hasAllAccess: nextHasAllAccess,
+    allowedCategories: nextAllowedCategories,
+    assignedCourses: nextAllowedCategories,
+    subscriptionStatus: 'active',
+    accessExpiry: expiryIso
+  };
+
+  const users = readStorage<Record<string, UserProfile>>(STORAGE_KEYS.USERS, {});
+  users[params.targetUid] = updatedProfile;
+  writeStorage(STORAGE_KEYS.USERS, users);
+  eventBus.emit('users', Object.values(users));
+
+  const current = readStorage<UserProfile | null>(STORAGE_KEYS.CURRENT_USER, null);
+  if (current && current.uid === params.targetUid) {
+    writeStorage(STORAGE_KEYS.CURRENT_USER, updatedProfile);
+    eventBus.emit('auth', updatedProfile);
+  }
+
+  if (updatedPayment) {
+    const payments = readStorage<Record<string, PaymentRequest>>(STORAGE_KEYS.PAYMENTS, {});
+    payments[updatedPayment.id] = updatedPayment;
+    writeStorage(STORAGE_KEYS.PAYMENTS, payments);
+    eventBus.emit('payments', Object.values(payments));
+    void notifyPaymentResolution(updatedPayment.id, 'approved', updatedPayment.adminNote);
+  }
+
+  if (sale) {
+    const salesMap = readStorage<Record<string, SalesRecord>>(STORAGE_KEYS.SALES, {});
+    salesMap[sale.id] = sale;
+    writeStorage(STORAGE_KEYS.SALES, salesMap);
+    eventBus.emit('sales', Object.values(salesMap));
+  }
+
+  const categoriesMap = readStorage<Record<string, Category>>(STORAGE_KEYS.CATEGORIES, {});
+  const grantedLabel =
+    params.grantType === 'all_access'
+      ? 'All-Access Pass'
+      : (params.categoryIds || []).map(id => categoriesMap[id]?.name || id).join(', ');
+  const durationLabel =
+    params.durationType === 'permanent'
+      ? 'Permanent / Lifetime'
+      : `Expires ${expiryIso ? new Date(expiryIso).toLocaleDateString() : ''}`;
+
+  await recordAuditLog({
+    actorUid: actor.uid,
+    actorEmail: actor.email,
+    actorRole: actor.role,
+    action: 'manual_access.grant',
+    targetUid: updatedProfile.uid,
+    targetEmail: updatedProfile.email,
+    details: `Manually granted ${grantedLabel} (${durationLabel})${updatedPayment ? ` and approved payment ${updatedPayment.id}` : ''}.${params.adminNote ? ` Note: ${params.adminNote}` : ''}`
+  });
+
+  return updatedProfile;
+}
+
+export async function toggleStudentAccountStatus(
+  actor: UserProfile,
+  targetUid: string,
+  suspend: boolean
+): Promise<UserProfile> {
+  if (!db || !auth?.currentUser || auth.currentUser.uid !== actor.uid) {
+    throw new Error('A signed-in administrator and Firestore connection are required.');
+  }
+  const canManage = isProtectedOwner(actor) || hasPermission(actor, 'students.manage');
+  if (!canManage || actor.isSuspended) {
+    throw new Error('Permission denied: You do not have permission to change account status.');
+  }
+
+  const targetRef = doc(db, 'users', targetUid);
+  const targetSnap = await getDoc(targetRef);
+  if (!targetSnap.exists()) throw new Error('User not found in Firestore.');
+  const target = normalizeUserProfile(targetSnap.id, targetSnap.data());
+
+  if (isProtectedOwner(target)) {
+    throw new Error('Action denied: Platform Owner cannot be suspended.');
+  }
+  if (target.role === 'master_admin' && !isProtectedOwner(actor)) {
+    throw new Error('Permission denied: Only Platform Owner can suspend a Super Admin.');
+  }
+
+  const nextStatus = suspend ? 'suspended' : 'active';
+  try {
+    await updateDoc(targetRef, { isSuspended: suspend, accountStatus: nextStatus });
+  } catch (err: any) {
+    handleFirestoreError(err, OperationType.UPDATE, `users/${targetUid}`);
+  }
+
+  const updated: UserProfile = { ...target, isSuspended: suspend, accountStatus: nextStatus };
+  const users = readStorage<Record<string, UserProfile>>(STORAGE_KEYS.USERS, {});
+  users[targetUid] = updated;
+  writeStorage(STORAGE_KEYS.USERS, users);
+  eventBus.emit('users', Object.values(users));
+
+  await recordAuditLog({
+    actorUid: actor.uid,
+    actorEmail: actor.email,
+    actorRole: actor.role,
+    action: suspend ? 'user.suspended' : 'user.reactivated',
+    targetUid: updated.uid,
+    targetEmail: updated.email,
+    details: `${suspend ? 'Suspended' : 'Reactivated'} account for ${updated.email || updated.uid}`
+  });
+
+  return updated;
+}
+
 export async function updateUserAllAccess(uid: string, hasAllAccess: boolean): Promise<void> {
   const users = readStorage<Record<string, UserProfile>>(STORAGE_KEYS.USERS, {});
 
@@ -2046,21 +2663,35 @@ export async function updateUserAllAccess(uid: string, hasAllAccess: boolean): P
     throw new Error('A signed-in administrator and Firestore connection are required.');
   }
 
-  // If the target user is missing from local cache, load the real Firestore profile.
-  if (!users[uid]) {
-    const targetSnap = await getDoc(doc(db, 'users', uid));
-    if (!targetSnap.exists()) throw new Error(`User ${uid} not found`);
-    users[uid] = { ...targetSnap.data(), uid: targetSnap.id } as UserProfile;
-    writeStorage(STORAGE_KEYS.USERS, users);
+  const targetSnap = await getDoc(doc(db, 'users', uid));
+  if (!targetSnap.exists()) throw new Error(`User ${uid} not found`);
+  const target = normalizeUserProfile(targetSnap.id, targetSnap.data());
+
+  const subscriptionStatus =
+    hasAllAccess || (target.allowedCategories?.length || 0) > 0 ? 'active' : 'cancelled';
+  const expiryDate = hasAllAccess ? new Date(Date.now() + 365 * 24 * 60 * 60 * 1000) : null;
+  const accessExpiry = expiryDate ? expiryDate.toISOString() : null;
+  const accessExpiryAt = expiryDate ? Timestamp.fromDate(expiryDate) : null;
+
+  try {
+    await updateDoc(doc(db, 'users', uid), {
+      hasAllAccess,
+      allowedCategories: target.allowedCategories,
+      assignedCourses: target.allowedCategories,
+      subscriptionStatus,
+      accessExpiry,
+      accessExpiryAt
+    });
+  } catch (err: any) {
+    handleFirestoreError(err, OperationType.UPDATE, `users/${uid}`);
   }
 
-  const subscriptionStatus = hasAllAccess ? 'active' : 'cancelled';
-  const accessExpiry = hasAllAccess ? new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString() : null;
-  try { await updateDoc(doc(db, 'users', uid), { hasAllAccess, subscriptionStatus, accessExpiry }); }
-  catch (err: any) { throw firebaseAuthMessage(err, 'Firebase rejected this access change. No local changes were saved.'); }
-  users[uid].hasAllAccess = hasAllAccess;
-  users[uid].subscriptionStatus = subscriptionStatus;
-  users[uid].accessExpiry = accessExpiry || undefined;
+  users[uid] = {
+    ...target,
+    hasAllAccess,
+    subscriptionStatus,
+    accessExpiry
+  };
 
   writeStorage(STORAGE_KEYS.USERS, users);
 
@@ -2071,7 +2702,6 @@ export async function updateUserAllAccess(uid: string, hasAllAccess: boolean): P
   }
 
   eventBus.emit('users', Object.values(users));
-
 }
 
 export async function updateUserCategoryAccess(uid: string, categoryId: string, enabled: boolean): Promise<void> {
@@ -2081,15 +2711,11 @@ export async function updateUserCategoryAccess(uid: string, categoryId: string, 
     throw new Error('A signed-in administrator and Firestore connection are required.');
   }
 
-  // Recover the target user from Firestore if absent from local cache.
-  if (!users[uid]) {
-    const targetSnap = await getDoc(doc(db, 'users', uid));
-    if (!targetSnap.exists()) throw new Error(`User ${uid} not found`);
-    users[uid] = { ...targetSnap.data(), uid: targetSnap.id } as UserProfile;
-    writeStorage(STORAGE_KEYS.USERS, users);
-  }
+  const targetSnap = await getDoc(doc(db, 'users', uid));
+  if (!targetSnap.exists()) throw new Error(`User ${uid} not found`);
+  const target = normalizeUserProfile(targetSnap.id, targetSnap.data());
 
-  const currentCats = new Set(users[uid].allowedCategories || []);
+  const currentCats = new Set(target.allowedCategories || []);
   if (enabled) {
     currentCats.add(categoryId);
   } else {
@@ -2097,10 +2723,25 @@ export async function updateUserCategoryAccess(uid: string, categoryId: string, 
   }
 
   const allowedCategories = Array.from(currentCats);
-  if (!db || !auth?.currentUser) throw new Error('A signed-in administrator and Firestore connection are required.');
-  try { await updateDoc(doc(db, 'users', uid), { allowedCategories }); }
-  catch (err: any) { throw firebaseAuthMessage(err, 'Firebase rejected this category access change. No local changes were saved.'); }
-  users[uid].allowedCategories = allowedCategories;
+  const subscriptionStatus = target.hasAllAccess || allowedCategories.length > 0 ? 'active' : 'none';
+
+  try {
+    await updateDoc(doc(db, 'users', uid), {
+      hasAllAccess: target.hasAllAccess,
+      allowedCategories,
+      assignedCourses: allowedCategories,
+      subscriptionStatus
+    });
+  } catch (err: any) {
+    handleFirestoreError(err, OperationType.UPDATE, `users/${uid}`);
+  }
+
+  users[uid] = {
+    ...target,
+    allowedCategories,
+    assignedCourses: allowedCategories,
+    subscriptionStatus
+  };
   writeStorage(STORAGE_KEYS.USERS, users);
 
   const current = readStorage<UserProfile | null>(STORAGE_KEYS.CURRENT_USER, null);
@@ -2110,16 +2751,48 @@ export async function updateUserCategoryAccess(uid: string, categoryId: string, 
   }
 
   eventBus.emit('users', Object.values(users));
-
 }
 
 export async function setAllCategoriesAccess(uid: string, enabled: boolean): Promise<void> {
+  if (!db || !auth?.currentUser) {
+    throw new Error('A signed-in administrator and Firestore connection are required.');
+  }
+
   const users = readStorage<Record<string, UserProfile>>(STORAGE_KEYS.USERS, {});
-  if (!users[uid]) throw new Error(`User ${uid} not found`);
+  const targetSnap = await getDoc(doc(db, 'users', uid));
+  if (!targetSnap.exists()) throw new Error(`User ${uid} not found`);
+  const target = normalizeUserProfile(targetSnap.id, targetSnap.data());
 
-  const categories = readStorage<Record<string, Category>>(STORAGE_KEYS.CATEGORIES, {});
-  users[uid].allowedCategories = enabled ? Object.keys(categories) : [];
+  let categories = readStorage<Record<string, Category>>(STORAGE_KEYS.CATEGORIES, {});
+  if (Object.keys(categories).length === 0) {
+    const catsSnap = await getDocs(collection(db, 'categories'));
+    const remoteCats: Record<string, Category> = {};
+    catsSnap.forEach(d => {
+      remoteCats[d.id] = { id: d.id, ...d.data() } as Category;
+    });
+    categories = remoteCats;
+  }
 
+  const allowedCategories = enabled ? Object.keys(categories) : [];
+  const subscriptionStatus = target.hasAllAccess || allowedCategories.length > 0 ? 'active' : 'none';
+
+  try {
+    await updateDoc(doc(db, 'users', uid), {
+      hasAllAccess: target.hasAllAccess,
+      allowedCategories,
+      assignedCourses: allowedCategories,
+      subscriptionStatus
+    });
+  } catch (err: any) {
+    handleFirestoreError(err, OperationType.UPDATE, `users/${uid}`);
+  }
+
+  users[uid] = {
+    ...target,
+    allowedCategories,
+    assignedCourses: allowedCategories,
+    subscriptionStatus
+  };
   writeStorage(STORAGE_KEYS.USERS, users);
 
   const current = readStorage<UserProfile | null>(STORAGE_KEYS.CURRENT_USER, null);
@@ -2129,16 +2802,6 @@ export async function setAllCategoriesAccess(uid: string, enabled: boolean): Pro
   }
 
   eventBus.emit('users', Object.values(users));
-
-  if (db && isFirebaseOnline) {
-    try {
-      await updateDoc(doc(db, 'users', uid), { 
-        allowedCategories: users[uid].allowedCategories 
-      });
-    } catch (e) {
-      console.warn('Remote batch category access note:', e);
-    }
-  }
 }
 
 // ==========================================
@@ -2146,33 +2809,40 @@ export async function setAllCategoriesAccess(uid: string, enabled: boolean): Pro
 // ==========================================
 
 export function subscribeToAuditLogs(callback: (logs: AuditLog[]) => void): () => void {
-  const loadLocal = () => {
-    const list = readStorage<AuditLog[]>(STORAGE_KEYS.AUDIT_LOGS, []);
-    list.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-    callback(list);
-  };
-  loadLocal();
+  callback([]);
+  if (!db || !isFirebaseOnline || !auth?.currentUser) return () => {};
 
   const unsubEvent = eventBus.subscribe<AuditLog[]>('audit_logs', callback);
-
   let unsubFb: (() => void) | null = null;
-  if (db && isFirebaseOnline) {
-    try {
-      const q = query(collection(db, 'audit_logs'), orderBy('timestamp', 'desc'));
-      unsubFb = onSnapshot(q, (snapshot) => {
+  let cancelled = false;
+
+  void getDoc(doc(db, 'users', auth.currentUser.uid)).then((actorSnap) => {
+    if (cancelled) return;
+    const data = actorSnap.exists() ? actorSnap.data() : {};
+    const authorized =
+      isCurrentAuthUserPlatformOwner() ||
+      (data.isSuspended !== true &&
+        (data.role === 'master_admin' ||
+          (data.role === 'admin' && Array.isArray(data.permissions) && data.permissions.includes('audit.view'))));
+    if (!authorized) return;
+
+    const q = query(collection(db, 'audit_logs'), orderBy('timestamp', 'desc'));
+    unsubFb = onSnapshot(
+      q,
+      (snapshot) => {
         const remote: AuditLog[] = [];
         snapshot.forEach(docSnap => remote.push({ id: docSnap.id, ...docSnap.data() } as AuditLog));
         writeStorage(STORAGE_KEYS.AUDIT_LOGS, remote);
         callback(remote);
-      }, (err) => {
+      },
+      (err) => {
         console.warn('Firestore audit logs snapshot note:', err.message);
-      });
-    } catch (e) {
-      console.warn('Firestore audit logs setup note:', e);
-    }
-  }
+      }
+    );
+  }).catch(() => {});
 
   return () => {
+    cancelled = true;
     unsubEvent();
     if (unsubFb) unsubFb();
   };
@@ -2322,13 +2992,17 @@ export async function resolvePaymentRequest(
     const studentRef = doc(db, 'users', req.uid);
     const studentSnapshot = await getDoc(studentRef);
     if (!studentSnapshot.exists()) throw new Error('The student profile is missing. Payment was not approved.');
-    updatedStudent = { uid: req.uid, ...studentSnapshot.data() } as UserProfile;
+    updatedStudent = normalizeUserProfile(req.uid, studentSnapshot.data());
+    const expiryDate = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000);
     if (req.planType === 'all_access') {
       updatedStudent.hasAllAccess = true;
       updatedStudent.subscriptionStatus = 'active';
-      updatedStudent.accessExpiry = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
+      updatedStudent.accessExpiry = expiryDate.toISOString();
     } else if (req.categoryId) {
-      updatedStudent.allowedCategories = Array.from(new Set([...(updatedStudent.allowedCategories || []), req.categoryId]));
+      updatedStudent.allowedCategories = Array.from(
+        new Set([...(updatedStudent.allowedCategories || []), ...(updatedStudent.assignedCourses || []), req.categoryId])
+      );
+      updatedStudent.assignedCourses = updatedStudent.allowedCategories;
       updatedStudent.subscriptionStatus = 'active';
     } else {
       throw new Error('This category payment request is missing its category.');
@@ -2336,8 +3010,10 @@ export async function resolvePaymentRequest(
     batch.update(studentRef, {
       hasAllAccess: updatedStudent.hasAllAccess,
       allowedCategories: updatedStudent.allowedCategories,
+      assignedCourses: updatedStudent.allowedCategories,
       subscriptionStatus: updatedStudent.subscriptionStatus,
-      accessExpiry: updatedStudent.accessExpiry || null
+      accessExpiry: updatedStudent.accessExpiry || null,
+      accessExpiryAt: updatedStudent.accessExpiry ? Timestamp.fromDate(new Date(updatedStudent.accessExpiry)) : null
     });
     const saleId = `sale_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
     sale = {
@@ -2355,7 +3031,7 @@ export async function resolvePaymentRequest(
   try {
     await batch.commit();
   } catch (err: any) {
-    throw firebaseAuthMessage(err, 'Firebase rejected this payment update. No local changes were applied. Check administrator permissions and Firestore rules.');
+    handleFirestoreError(err, OperationType.WRITE, `paymentRequests/${requestId}`);
   }
 
   const updatedRequest = { ...req, status, adminNote: adminNote || '', resolvedAt: now, resolvedBy: adminEmail };
@@ -2493,13 +3169,48 @@ export async function updateSettings(settings: Partial<PlatformSettings>, actor?
 }
 
 export function subscribeToSales(callback: (sales: SalesRecord[]) => void): () => void {
-  const loadLocal = () => {
-    const map = readStorage<Record<string, SalesRecord>>(STORAGE_KEYS.SALES, {});
-    callback(Object.values(map));
-  };
-  loadLocal();
+  callback([]);
+  if (!db || !isFirebaseOnline || !auth?.currentUser) return () => {};
 
-  return eventBus.subscribe<SalesRecord[]>('sales', callback);
+  const unsubEvent = eventBus.subscribe<SalesRecord[]>('sales', callback);
+  let unsubFb: (() => void) | null = null;
+  let cancelled = false;
+
+  void getDoc(doc(db, 'users', auth.currentUser.uid)).then((actorSnap) => {
+    if (cancelled) return;
+    const data = actorSnap.exists() ? actorSnap.data() : {};
+    const authorized =
+      isCurrentAuthUserPlatformOwner() ||
+      (data.isSuspended !== true &&
+        (data.role === 'master_admin' ||
+          (data.role === 'admin' && Array.isArray(data.permissions) && data.permissions.includes('analytics.view'))));
+    if (!authorized) return;
+
+    unsubFb = onSnapshot(
+      collection(db, 'sales_analytics'),
+      (snapshot) => {
+        const map: Record<string, SalesRecord> = {};
+        const list: SalesRecord[] = [];
+        snapshot.forEach(docSnap => {
+          const item = { id: docSnap.id, ...docSnap.data() } as SalesRecord;
+          map[docSnap.id] = item;
+          list.push(item);
+        });
+        list.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+        writeStorage(STORAGE_KEYS.SALES, map);
+        callback(list);
+      },
+      (err) => {
+        console.warn('Firestore sales snapshot warning:', err.message);
+      }
+    );
+  }).catch(() => {});
+
+  return () => {
+    cancelled = true;
+    unsubEvent();
+    if (unsubFb) unsubFb();
+  };
 }
 
 // Watch progress tracker for video masterclasses

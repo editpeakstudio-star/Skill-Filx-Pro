@@ -17,7 +17,7 @@ interface CachedServiceToken {
 }
 
 let jwkCache: CachedJwks | null = null;
-let serviceTokenCache: CachedServiceToken | null = null;
+const serviceTokenCache = new Map<string, CachedServiceToken>();
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -310,7 +310,10 @@ export function hasServiceAccountConfig(env: WorkerEnv): boolean {
   return Boolean(env.FIREBASE_CLIENT_EMAIL?.trim() && env.FIREBASE_PRIVATE_KEY?.trim());
 }
 
-export async function getServiceAccountAccessToken(env: WorkerEnv): Promise<string> {
+export async function getServiceAccountAccessToken(
+  env: WorkerEnv,
+  scope = 'https://www.googleapis.com/auth/datastore'
+): Promise<string> {
   const clientEmail = (env.FIREBASE_CLIENT_EMAIL || '').trim();
   const privateKeyPem = (env.FIREBASE_PRIVATE_KEY || '').trim();
   if (!clientEmail || !privateKeyPem) {
@@ -320,13 +323,11 @@ export async function getServiceAccountAccessToken(env: WorkerEnv): Promise<stri
     );
   }
 
+  const cacheKey = `${clientEmail}::${scope}`;
+  const cached = serviceTokenCache.get(cacheKey);
   const nowMs = Date.now();
-  if (
-    serviceTokenCache &&
-    serviceTokenCache.clientEmail === clientEmail &&
-    serviceTokenCache.expiresAt > nowMs + 60_000
-  ) {
-    return serviceTokenCache.accessToken;
+  if (cached && cached.expiresAt > nowMs + 60_000) {
+    return cached.accessToken;
   }
 
   const nowSec = Math.floor(nowMs / 1000);
@@ -336,7 +337,7 @@ export async function getServiceAccountAccessToken(env: WorkerEnv): Promise<stri
       iss: clientEmail,
       sub: clientEmail,
       aud: 'https://oauth2.googleapis.com/token',
-      scope: 'https://www.googleapis.com/auth/datastore',
+      scope,
       iat: nowSec,
       exp: nowSec + 3600
     })
@@ -401,13 +402,14 @@ export async function getServiceAccountAccessToken(env: WorkerEnv): Promise<stri
     );
   }
 
-  serviceTokenCache = {
+  const tokenEntry: CachedServiceToken = {
     accessToken: tokenJson.access_token,
     expiresAt: nowMs + Math.max(300, Number(tokenJson.expires_in || 3600)) * 1000,
     clientEmail
   };
+  serviceTokenCache.set(cacheKey, tokenEntry);
 
-  return serviceTokenCache.accessToken;
+  return tokenEntry.accessToken;
 }
 
 export async function getFirestoreAuthToken(
@@ -678,7 +680,7 @@ export async function deleteFirestoreDoc(
 export async function authorizeAdmin(
   authHeader: string | null,
   env: WorkerEnv,
-  requiredPermission: 'telegram.manage' | 'payments.verify' = 'telegram.manage'
+  requiredPermission: 'telegram.manage' | 'payments.verify' | 'students.manage' = 'telegram.manage'
 ): Promise<VerifiedAdmin> {
   const match = (authHeader || '').match(/^Bearer\s+(.+)$/i);
   const idToken = match ? match[1].trim() : '';
@@ -688,7 +690,7 @@ export async function authorizeAdmin(
     return {
       ...user,
       role: 'owner',
-      permissions: ['telegram.manage', 'payments.verify', 'settings.manage']
+      permissions: ['telegram.manage', 'payments.verify', 'settings.manage', 'students.manage']
     };
   }
 
@@ -713,11 +715,143 @@ export async function authorizeAdmin(
   if (role === 'admin') {
     const allowed =
       permissions.includes(requiredPermission) ||
-      (requiredPermission === 'telegram.manage' && permissions.includes('settings.manage'));
+      (requiredPermission === 'telegram.manage' && permissions.includes('settings.manage')) ||
+      (requiredPermission === 'students.manage' && permissions.includes('payments.verify'));
     if (allowed) {
       return { ...user, role: 'admin', permissions };
     }
   }
 
-  throw new HttpError(403, 'Forbidden: You do not have permission to access Telegram Bot Manager.');
+  throw new HttpError(403, 'Forbidden: You do not have permission to perform this administrative action.');
+}
+
+interface IdentityToolkitUser {
+  localId?: string;
+  email?: string;
+  displayName?: string;
+  photoUrl?: string;
+  phoneNumber?: string;
+  createdAt?: string;
+  lastLoginAt?: string;
+  disabled?: boolean;
+  providerUserInfo?: Array<{ providerId?: string }>;
+}
+
+function resolveProviderName(info?: Array<{ providerId?: string }>, phoneNumber?: string): string {
+  const ids = (info || []).map(p => (p.providerId || '').toLowerCase());
+  if (ids.includes('google.com')) return 'google';
+  if (ids.includes('phone') || (phoneNumber && ids.length === 0)) return 'phone';
+  if (ids.includes('password')) return 'password';
+  return ids[0] || 'other';
+}
+
+export async function syncFirebaseAuthUsersToFirestore(env: WorkerEnv): Promise<{
+  syncedCount: number;
+  totalAuthUsers: number;
+  alreadySyncedCount: number;
+}> {
+  if (!hasServiceAccountConfig(env)) {
+    throw new HttpError(
+      500,
+      'Service account secrets (FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY) must be configured in Cloudflare Worker to sync legacy Firebase Auth users.'
+    );
+  }
+
+  const projectId = getProjectId(env);
+  const accessToken = await getServiceAccountAccessToken(
+    env,
+    'https://www.googleapis.com/auth/cloud-platform'
+  );
+
+  const authUsers: IdentityToolkitUser[] = [];
+  let nextPageToken = '';
+  for (let i = 0; i < 20; i++) {
+    const url = new URL(
+      `https://identitytoolkit.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/accounts:batchGet`
+    );
+    url.searchParams.set('maxResults', '500');
+    if (nextPageToken) url.searchParams.set('nextPageToken', nextPageToken);
+
+    const res = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' }
+    });
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      throw new HttpError(
+        res.status === 403 ? 403 : 502,
+        `Failed to list Firebase Auth users (${res.status}): ${errText.slice(0, 180)}`
+      );
+    }
+    const json = (await res.json()) as {
+      users?: IdentityToolkitUser[];
+      nextPageToken?: string;
+    };
+    if (Array.isArray(json.users)) {
+      authUsers.push(...json.users);
+    }
+    if (!json.nextPageToken) break;
+    nextPageToken = json.nextPageToken;
+  }
+
+  const existingDocs = await listFirestoreCollection(env, accessToken, 'users');
+  const existingUids = new Set(
+    existingDocs
+      .map(d => (typeof d.id === 'string' ? d.id : typeof d.uid === 'string' ? d.uid : ''))
+      .filter(Boolean)
+  );
+
+  let syncedCount = 0;
+  const nowIso = new Date().toISOString();
+
+  for (const authUser of authUsers) {
+    const uid = (authUser.localId || '').trim();
+    if (!uid || existingUids.has(uid)) continue;
+
+    const email = (authUser.email || '').trim().toLowerCase();
+    const isOwner = email === PLATFORM_OWNER_EMAIL;
+    const createdMs = Number(authUser.createdAt || 0);
+    const lastLoginMs = Number(authUser.lastLoginAt || 0);
+    const createdAtIso = Number.isFinite(createdMs) && createdMs > 0 ? new Date(createdMs).toISOString() : nowIso;
+    const lastLoginIso =
+      Number.isFinite(lastLoginMs) && lastLoginMs > 0 ? new Date(lastLoginMs).toISOString() : createdAtIso;
+    const displayName =
+      (authUser.displayName || '').trim() ||
+      (email ? email.split('@')[0] : '') ||
+      authUser.phoneNumber ||
+      'Student';
+    const suspended = authUser.disabled === true && !isOwner;
+
+    const profileData: Record<string, unknown> = {
+      uid,
+      email,
+      displayName,
+      photoURL: authUser.photoUrl || '',
+      phoneNumber: authUser.phoneNumber || '',
+      authProvider: resolveProviderName(authUser.providerUserInfo, authUser.phoneNumber),
+      role: isOwner ? 'master_admin' : 'user',
+      hasAllAccess: isOwner,
+      allowedCategories: [],
+      assignedCourses: [],
+      subscriptionStatus: 'none',
+      accessExpiry: null,
+      accountStatus: suspended ? 'suspended' : 'active',
+      isSuspended: suspended,
+      createdAt: createdAtIso,
+      lastLogin: lastLoginIso,
+      lastLoginAt: lastLoginIso,
+      ...(isOwner ? { isPlatformOwner: true } : {})
+    };
+
+    const created = await createFirestoreDocIfNotExists(env, accessToken, 'users', uid, profileData);
+    if (created) {
+      syncedCount++;
+      existingUids.add(uid);
+    }
+  }
+
+  return {
+    syncedCount,
+    totalAuthUsers: authUsers.length,
+    alreadySyncedCount: Math.max(0, authUsers.length - syncedCount)
+  };
 }

@@ -51,7 +51,12 @@ import {
   Bot,
   Copy,
   RefreshCw,
-  Send
+  Send,
+  ZoomIn,
+  ZoomOut,
+  RotateCcw,
+  Unlock,
+  Clock
 } from 'lucide-react';
 import { 
   UserProfile, 
@@ -88,10 +93,14 @@ import {
   deletePdf,
   updateAdminRoleAndPermissions,
   toggleAdminSuspension,
+  toggleStudentAccountStatus,
   removeAdminPrivileges,
   updateUserAllAccess, 
   updateUserCategoryAccess, 
   setAllCategoriesAccess,
+  grantManualCourseAccess,
+  isUserAccessActive,
+  isUserAccessExpired,
   resolvePaymentRequest, 
   updateSettings,
   validateIndianMobile,
@@ -101,7 +110,11 @@ import {
   purgeUnwantedRecordsFromFirestore,
   cleanUnwantedLocalRecords
 } from '../services/firebase';
-import { fetchPaymentNotificationJobs, retryTelegramJobFailed } from '../services/telegramApi';
+import {
+  fetchPaymentNotificationJobs,
+  retryTelegramJobFailed,
+  syncExistingAuthUsers
+} from '../services/telegramApi';
 import { TelegramBotManager, TelegramBotManagerBoundary } from '../components/TelegramBotManager';
 import { useToast } from '../components/Toast';
 
@@ -191,6 +204,29 @@ export const AdminView: React.FC<AdminViewProps> = ({
   const [folderSearch, setFolderSearch] = useState('');
   const [userSearch, setUserSearch] = useState('');
   const [userRoleFilter, setUserRoleFilter] = useState<'all' | 'owner' | 'master' | 'admin' | 'student'>('all');
+  const [userAccessFilter, setUserAccessFilter] = useState<'all' | 'active' | 'new' | 'has_access' | 'suspended'>('all');
+  const [isSyncingUsers, setIsSyncingUsers] = useState(false);
+
+  // Payment review & zoom state
+  const [paymentSearch, setPaymentSearch] = useState('');
+  const [paymentStatusFilter, setPaymentStatusFilter] = useState<'all' | 'pending' | 'approved' | 'rejected'>('all');
+  const [proofZoom, setProofZoom] = useState(1);
+
+  // Manual Course Access Grant Modal state
+  const [isManualGrantOpen, setIsManualGrantOpen] = useState(false);
+  const [manualGrantUserUid, setManualGrantUserUid] = useState('');
+  const [manualGrantUserSearch, setManualGrantUserSearch] = useState('');
+  const [manualGrantAllAccess, setManualGrantAllAccess] = useState(false);
+  const [manualGrantCourseIds, setManualGrantCourseIds] = useState<string[]>([]);
+  const [manualGrantMergeExisting, setManualGrantMergeExisting] = useState(true);
+  const [manualGrantDurationType, setManualGrantDurationType] = useState<'lifetime' | 'expiry'>('lifetime');
+  const [manualGrantDays, setManualGrantDays] = useState(30);
+  const [manualGrantCustomDate, setManualGrantCustomDate] = useState('');
+  const [manualGrantPaymentId, setManualGrantPaymentId] = useState('');
+  const [manualGrantApprovePayment, setManualGrantApprovePayment] = useState(false);
+  const [manualGrantNote, setManualGrantNote] = useState('');
+  const [isSubmittingManualGrant, setIsSubmittingManualGrant] = useState(false);
+
   const [auditSearch, setAuditSearch] = useState('');
   const [videoSearch, setVideoSearch] = useState('');
   const [pdfSearch, setPdfSearch] = useState('');
@@ -650,10 +686,130 @@ export const AdminView: React.FC<AdminViewProps> = ({
     if (!currentUser) return;
     const nextState = !user.isSuspended;
     try {
-      await toggleAdminSuspension(currentUser, user.uid, nextState);
-      showToast(nextState ? `Suspended administrative access for ${user.displayName}` : `Reactivated access for ${user.displayName}`, 'info');
+      if (user.role === 'user' && !isProtectedOwner(user)) {
+        await toggleStudentAccountStatus(currentUser, user.uid, nextState);
+      } else {
+        await toggleAdminSuspension(currentUser, user.uid, nextState);
+      }
+      showToast(nextState ? `Suspended account for ${user.displayName}` : `Reactivated account for ${user.displayName}`, 'info');
     } catch (err: any) {
       showToast(err.message || 'Failed to toggle suspension.', 'error');
+    }
+  };
+
+  const handleSyncAuthUsers = async () => {
+    if (isSyncingUsers) return;
+    setIsSyncingUsers(true);
+    try {
+      const res = await syncExistingAuthUsers();
+      showToast(
+        res.syncedCount > 0
+          ? `Synced ${res.syncedCount} existing Firebase Auth user(s) into Firestore (${res.totalAuthUsers} total Auth users).`
+          : `All ${res.totalAuthUsers} Firebase Auth users are already synced in Firestore.`,
+        'success'
+      );
+    } catch (err: any) {
+      showToast(err.message || 'Could not sync existing Auth users from backend.', 'error');
+    } finally {
+      setIsSyncingUsers(false);
+    }
+  };
+
+  const openManualGrantModal = (options?: { user?: UserProfile; payment?: PaymentRequest }) => {
+    const targetUser =
+      options?.user ||
+      (options?.payment ? users.find(u => u.uid === options.payment!.uid) : undefined);
+
+    setManualGrantUserUid(options?.payment?.uid || targetUser?.uid || '');
+    setManualGrantUserSearch('');
+    setManualGrantNote('');
+    setManualGrantCustomDate('');
+
+    if (options?.payment) {
+      const pay = options.payment;
+      const existingCourses = targetUser
+        ? Array.from(new Set([...(targetUser.allowedCategories || []), ...(targetUser.assignedCourses || [])]))
+        : [];
+      setManualGrantAllAccess(pay.planType === 'all_access' || Boolean(targetUser?.hasAllAccess));
+      setManualGrantCourseIds(
+        pay.categoryId
+          ? Array.from(new Set([...existingCourses, pay.categoryId]))
+          : existingCourses
+      );
+      setManualGrantMergeExisting(true);
+      setManualGrantDurationType(pay.planType === 'all_access' ? 'expiry' : 'lifetime');
+      setManualGrantDays(365);
+      setManualGrantPaymentId(pay.id);
+      setManualGrantApprovePayment(pay.status === 'pending');
+    } else if (targetUser) {
+      const existingCourses = Array.from(
+        new Set([...(targetUser.allowedCategories || []), ...(targetUser.assignedCourses || [])])
+      );
+      setManualGrantAllAccess(Boolean(targetUser.hasAllAccess));
+      setManualGrantCourseIds(existingCourses);
+      setManualGrantMergeExisting(true);
+      setManualGrantDurationType(targetUser.accessExpiry ? 'expiry' : 'lifetime');
+      setManualGrantDays(30);
+      setManualGrantPaymentId('');
+      setManualGrantApprovePayment(false);
+    } else {
+      setManualGrantAllAccess(false);
+      setManualGrantCourseIds([]);
+      setManualGrantMergeExisting(true);
+      setManualGrantDurationType('lifetime');
+      setManualGrantDays(30);
+      setManualGrantPaymentId('');
+      setManualGrantApprovePayment(false);
+    }
+
+    setIsManualGrantOpen(true);
+  };
+
+  const handleSubmitManualGrant = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!currentUser) return;
+    if (!manualGrantUserUid) {
+      showToast('Select a user to grant course access.', 'error');
+      return;
+    }
+    if (!manualGrantAllAccess && manualGrantCourseIds.length === 0) {
+      showToast('Select at least one course or enable All-Access Pass.', 'error');
+      return;
+    }
+
+    if (manualGrantDurationType === 'expiry' && manualGrantCustomDate) {
+      const parsed = new Date(`${manualGrantCustomDate.trim()}T23:59:59.999Z`);
+      if (Number.isNaN(parsed.getTime()) || parsed.getTime() <= Date.now()) {
+        showToast('Choose a valid future expiry date.', 'error');
+        return;
+      }
+    }
+
+    setIsSubmittingManualGrant(true);
+    try {
+      const updated = await grantManualCourseAccess(currentUser, {
+        targetUid: manualGrantUserUid,
+        grantType: manualGrantAllAccess ? 'all_access' : 'categories',
+        categoryIds: manualGrantCourseIds,
+        mergeWithExisting: manualGrantMergeExisting,
+        durationType: manualGrantDurationType === 'lifetime' ? 'permanent' : 'expiry',
+        durationDays: manualGrantDurationType === 'expiry' && !manualGrantCustomDate ? manualGrantDays : undefined,
+        customExpiryIso: manualGrantDurationType === 'expiry' && manualGrantCustomDate ? manualGrantCustomDate.trim() : undefined,
+        paymentRequestId: manualGrantPaymentId && manualGrantApprovePayment ? manualGrantPaymentId : undefined,
+        adminNote: manualGrantNote.trim() || undefined
+      });
+      showToast(
+        `Course access granted live to ${updated.displayName || updated.email || updated.uid}!`,
+        'success'
+      );
+      setIsManualGrantOpen(false);
+      if (manualGrantPaymentId && viewingProof?.id === manualGrantPaymentId && manualGrantApprovePayment) {
+        setViewingProof(null);
+      }
+    } catch (err: any) {
+      showToast(err.message || 'Could not grant course access.', 'error');
+    } finally {
+      setIsSubmittingManualGrant(false);
     }
   };
 
@@ -784,14 +940,46 @@ export const AdminView: React.FC<AdminViewProps> = ({
     return p.title.toLowerCase().includes(q) || p.categoryName.toLowerCase().includes(q);
   });
 
+  const sevenDaysAgoMs = Date.now() - 7 * 24 * 60 * 60 * 1000;
+
   const filteredUsers = users.filter(u => {
     if (userRoleFilter === 'owner' && !isProtectedOwner(u)) return false;
     if (userRoleFilter === 'master' && u.role !== 'master_admin') return false;
     if (userRoleFilter === 'admin' && (u.role !== 'admin' || isProtectedOwner(u))) return false;
     if (userRoleFilter === 'student' && u.role !== 'user') return false;
+
+    const suspended = u.isSuspended === true || u.accountStatus === 'suspended';
+    const createdMs = new Date(u.createdAt).getTime();
+    if (userAccessFilter === 'active' && suspended) return false;
+    if (userAccessFilter === 'suspended' && !suspended) return false;
+    if (userAccessFilter === 'new' && (Number.isNaN(createdMs) || createdMs < sevenDaysAgoMs)) return false;
+    if (userAccessFilter === 'has_access' && !isUserAccessActive(u)) return false;
+
     if (userSearch) {
       const q = userSearch.toLowerCase();
-      return u.email.toLowerCase().includes(q) || u.displayName.toLowerCase().includes(q) || (u.phoneNumber && u.phoneNumber.includes(q));
+      return (
+        u.email.toLowerCase().includes(q) ||
+        u.displayName.toLowerCase().includes(q) ||
+        u.uid.toLowerCase().includes(q) ||
+        (u.authProvider || '').toLowerCase().includes(q) ||
+        (u.phoneNumber && u.phoneNumber.includes(q))
+      );
+    }
+    return true;
+  });
+
+  const filteredPaymentRequests = paymentRequests.filter(req => {
+    if (paymentStatusFilter !== 'all' && req.status !== paymentStatusFilter) return false;
+    if (paymentSearch.trim()) {
+      const q = paymentSearch.trim().toLowerCase();
+      return (
+        (req.userName || '').toLowerCase().includes(q) ||
+        (req.userEmail || '').toLowerCase().includes(q) ||
+        (req.utr || '').toLowerCase().includes(q) ||
+        (req.id || '').toLowerCase().includes(q) ||
+        (req.categoryName || '').toLowerCase().includes(q) ||
+        (req.planType === 'all_access' && 'all-access pass'.includes(q))
+      );
     }
     return true;
   });
@@ -809,7 +997,14 @@ export const AdminView: React.FC<AdminViewProps> = ({
   const studentCount = users.filter(u => u.role === 'user' && !isProtectedOwner(u)).length;
   const adminCount = users.filter(u => u.role === 'admin' && !isProtectedOwner(u)).length;
   const masterCount = users.filter(u => u.role === 'master_admin' && !isProtectedOwner(u)).length;
-  const allAccessCount = users.filter(u => u.hasAllAccess).length;
+  const allAccessCount = users.filter(u => u.hasAllAccess && !isUserAccessExpired(u) && !u.isSuspended).length;
+  const activeUsersCount = users.filter(u => !u.isSuspended && u.accountStatus !== 'suspended').length;
+  const newUsersCount = users.filter(u => {
+    const ms = new Date(u.createdAt).getTime();
+    return !Number.isNaN(ms) && ms >= sevenDaysAgoMs;
+  }).length;
+  const usersWithActiveAccessCount = users.filter(u => isUserAccessActive(u)).length;
+  const suspendedUsersCount = users.filter(u => u.isSuspended || u.accountStatus === 'suspended').length;
 
   // Role badge renderer matching brand specifications:
   // Gold for Owner, Purple for Super Admin, Blue for Admin, Neutral for Student
@@ -2062,20 +2257,70 @@ export const AdminView: React.FC<AdminViewProps> = ({
         {/* ======================================================== */}
         {activeTab === 'users' && canManageStudents && (
           <div className="space-y-4 animate-in fade-in duration-150 min-w-0">
-            {/* Header */}
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            {/* Header + Action Controls */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
               <div>
                 <h2 className="text-base sm:text-lg font-bold text-white flex items-center gap-2">
                   <Users className="w-5 h-5 text-cyan-400" />
                   <span>User & Access Management</span>
                 </h2>
                 <p className="text-xs text-zinc-400">
-                  Assign administrative roles, manage category permissions, and configure student passes.
+                  Real-time directory of every registered user, login activity, account status, and manual course access.
                 </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => void handleSyncAuthUsers()}
+                  disabled={isSyncingUsers}
+                  className="min-h-[38px] px-3 py-1.5 rounded-xl bg-[#090D16] hover:bg-zinc-900 border border-blue-500/30 text-cyan-300 text-xs font-bold flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                  title="Import any pre-existing Firebase Auth users who haven't signed in since tracking was enabled"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isSyncingUsers ? 'animate-spin' : ''}`} />
+                  <span>{isSyncingUsers ? 'Syncing...' : 'Sync Auth Users'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => openManualGrantModal()}
+                  className="min-h-[38px] px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-emerald-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 text-white text-xs font-extrabold flex items-center gap-1.5 shadow-md shadow-emerald-600/20 cursor-pointer"
+                >
+                  <Unlock className="w-3.5 h-3.5" />
+                  <span>MANUALLY GRANT ACCESS</span>
+                </button>
               </div>
             </div>
 
-            {/* Search and Role Filter Bar (Responsive for 320px–430px) */}
+            {/* 5 Real-Time User KPI Cards */}
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5">
+              {[
+                { label: 'Total Registered Users', value: users.length, accent: 'text-white', border: 'border-blue-500/20', filter: 'all' as const },
+                { label: 'Active Users', value: activeUsersCount, accent: 'text-emerald-400', border: 'border-emerald-500/20', filter: 'active' as const },
+                { label: 'New Users (7d)', value: newUsersCount, accent: 'text-cyan-400', border: 'border-cyan-500/20', filter: 'new' as const },
+                { label: 'Users With Active Access', value: usersWithActiveAccessCount, accent: 'text-amber-300', border: 'border-amber-500/25', filter: 'has_access' as const },
+                { label: 'Suspended Users', value: suspendedUsersCount, accent: 'text-rose-400', border: 'border-rose-500/25', filter: 'suspended' as const }
+              ].map(card => (
+                <button
+                  key={card.label}
+                  type="button"
+                  onClick={() => setUserAccessFilter(card.filter)}
+                  className={`p-3 rounded-2xl bg-[#090D16] border text-left transition-all cursor-pointer ${
+                    userAccessFilter === card.filter
+                      ? 'ring-2 ring-cyan-400/60 border-cyan-400/40'
+                      : `${card.border} hover:border-blue-400/40`
+                  }`}
+                >
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400 block leading-tight">
+                    {card.label}
+                  </span>
+                  <span className={`text-xl sm:text-2xl font-extrabold tabular-nums mt-1 block ${card.accent}`}>
+                    {card.value}
+                  </span>
+                </button>
+              ))}
+            </div>
+
+            {/* Search and Role / Status Filter Bars (Responsive for 320px–430px) */}
             <div className="space-y-2.5">
               {/* Search Bar */}
               <div className="relative w-full">
@@ -2084,7 +2329,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
                   type="text"
                   value={userSearch}
                   onChange={e => setUserSearch(e.target.value)}
-                  placeholder="Search by name, email, or phone..."
+                  placeholder="Search by name, email, phone, UID, or auth provider..."
                   className="w-full pl-9 pr-9 py-2.5 rounded-xl bg-[#090D16] border border-blue-500/20 text-xs text-white placeholder-zinc-500 outline-none focus:border-cyan-400 transition-colors"
                 />
                 {userSearch && (
@@ -2101,7 +2346,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
               {/* Role Filter Pills (Mobile horizontal scrollable) */}
               <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar py-0.5 -mx-1 px-1">
                 {[
-                  { id: 'all', label: `All Users (${users.length})` },
+                  { id: 'all', label: `All Roles (${users.length})` },
                   { id: 'student', label: `Students (${studentCount})` },
                   { id: 'admin', label: `Admins (${adminCount})` },
                   { id: 'master', label: `Super Admins (${masterCount})` },
@@ -2115,6 +2360,30 @@ export const AdminView: React.FC<AdminViewProps> = ({
                       userRoleFilter === f.id
                         ? 'bg-blue-600 text-white shadow-md shadow-blue-600/30'
                         : 'bg-[#090D16] border border-zinc-800 text-zinc-400 hover:text-white hover:border-zinc-700'
+                    }`}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Status & Access Filter Pills */}
+              <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar py-0.5 -mx-1 px-1">
+                {[
+                  { id: 'all', label: 'All Status' },
+                  { id: 'active', label: `Active (${activeUsersCount})` },
+                  { id: 'has_access', label: `With Access (${usersWithActiveAccessCount})` },
+                  { id: 'new', label: `New 7d (${newUsersCount})` },
+                  { id: 'suspended', label: `Suspended (${suspendedUsersCount})` }
+                ].map((f) => (
+                  <button
+                    key={f.id}
+                    type="button"
+                    onClick={() => setUserAccessFilter(f.id as any)}
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold whitespace-nowrap transition-all cursor-pointer shrink-0 ${
+                      userAccessFilter === f.id
+                        ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                        : 'bg-[#090D16] border border-zinc-800/80 text-zinc-400 hover:text-white'
                     }`}
                   >
                     {f.label}
@@ -2141,16 +2410,27 @@ export const AdminView: React.FC<AdminViewProps> = ({
                 <div className="p-8 rounded-2xl bg-[#090D16] border border-zinc-800 text-center space-y-2">
                   <Users className="w-8 h-8 text-zinc-600 mx-auto" />
                   <p className="text-xs font-bold text-zinc-300">No users match your search criteria</p>
-                  <p className="text-[11px] text-zinc-500">Try clearing the search query or changing the role filter.</p>
+                  <p className="text-[11px] text-zinc-500">Try clearing the search query, resetting status filters, or click Sync Auth Users.</p>
                 </div>
               ) : (
                 filteredUsers.map((user) => {
                   const isUserOwner = isProtectedOwner(user);
                   const isUserMaster = user.role === 'master_admin';
                   const isUserAdmin = user.role === 'admin';
-                  const userCatsCount = user.hasAllAccess 
-                    ? categories.length 
-                    : (user.allowedCategories?.length || 0);
+                  const mergedUserCourses = Array.from(
+                    new Set([...(user.allowedCategories || []), ...(user.assignedCourses || [])])
+                  );
+                  const userCatsCount = user.hasAllAccess
+                    ? categories.length
+                    : mergedUserCourses.length;
+                  const userExpired = isUserAccessExpired(user);
+                  const userSuspended = user.isSuspended === true || user.accountStatus === 'suspended';
+                  const lastLoginStr = user.lastLoginAt || user.lastLogin;
+                  const expiryText = user.accessExpiry
+                    ? `${userExpired ? 'Expired' : 'Expires'} ${new Date(user.accessExpiry).toLocaleDateString()}`
+                    : isUserAccessActive(user)
+                      ? 'Lifetime / Permanent'
+                      : 'Free Tier';
 
                   return (
                     <div
@@ -2185,41 +2465,49 @@ export const AdminView: React.FC<AdminViewProps> = ({
                           </div>
                         </div>
 
-                        {/* Name, Role Badge, Email, Phone */}
+                        {/* Name, Role Badge, Provider, Email, Dates */}
                         <div className="min-w-0 flex-1">
                           <div className="flex flex-wrap items-center gap-1.5">
                             <span className="text-xs sm:text-sm font-bold text-white break-words">
                               {user.displayName || 'Anonymous Student'}
                             </span>
                             {renderRoleBadge(user)}
-                            {user.isSuspended && (
-                              <span className="text-[9px] font-extrabold uppercase px-1.5 py-0.2 rounded bg-rose-500/20 text-rose-300 border border-rose-500/40 shrink-0">
-                                SUSPENDED
-                              </span>
-                            )}
+                            <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-300 border border-zinc-700">
+                              {user.authProvider || 'email'}
+                            </span>
+                            <span className={`text-[9px] font-extrabold uppercase px-1.5 py-0.5 rounded shrink-0 ${
+                              userSuspended
+                                ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+                                : 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
+                            }`}>
+                              {userSuspended ? 'SUSPENDED' : 'ACTIVE'}
+                            </span>
                           </div>
 
                           <span className="text-[11px] text-zinc-400 font-mono break-all block mt-0.5">
-                            {user.email}
+                            {user.email || user.phoneNumber || user.uid}
                           </span>
 
-                          {user.phoneNumber && (
-                            <span className="text-[10px] text-zinc-500 font-mono flex items-center gap-1 mt-0.5">
-                              <Phone className="w-2.5 h-2.5 text-zinc-400" />
-                              <span>{user.phoneNumber}</span>
-                            </span>
-                          )}
+                          <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] text-zinc-500 font-mono mt-1">
+                            <span>Joined: {user.createdAt ? new Date(user.createdAt).toLocaleDateString() : 'N/A'}</span>
+                            <span>Last Login: {lastLoginStr ? new Date(lastLoginStr).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }) : 'N/A'}</span>
+                            {user.phoneNumber && (
+                              <span className="inline-flex items-center gap-1 text-zinc-400">
+                                <Phone className="w-2.5 h-2.5" />
+                                {user.phoneNumber}
+                              </span>
+                            )}
+                          </div>
                         </div>
                       </div>
 
-                      {/* Permissions Summary & All-Access Status Row */}
+                      {/* Subscription Status & Access Details Row */}
                       <div className="p-2.5 rounded-xl bg-[#05070D] border border-zinc-800/80 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
-                        {/* Summary description */}
                         <div className="min-w-0">
                           <span className="text-[10px] uppercase font-bold text-zinc-500 block mb-0.5">
-                            Authority & Privileges
+                            Subscription & Access Details
                           </span>
-                          <span className="text-xs text-zinc-300 font-medium truncate block">
+                          <span className="text-xs text-zinc-300 font-medium block break-words">
                             {isUserOwner ? (
                               <span className="text-amber-300 font-semibold">Immutable Platform Owner (Full Control)</span>
                             ) : isUserMaster ? (
@@ -2230,36 +2518,48 @@ export const AdminView: React.FC<AdminViewProps> = ({
                               </span>
                             ) : (
                               <span>
-                                {user.hasAllAccess 
-                                  ? 'All-Access Pass Holder (All Courses Unlocked)' 
-                                  : `${userCatsCount} of ${categories.length} Categories Unlocked`}
+                                {user.hasAllAccess
+                                  ? `All-Access Pass • ${expiryText}`
+                                  : mergedUserCourses.length > 0
+                                    ? `${mergedUserCourses.length} Course(s) Unlocked • ${expiryText}`
+                                    : `No Active Courses • ${expiryText}`}
                               </span>
                             )}
                           </span>
                         </div>
 
-                        {/* All-Access Badge */}
-                        <div className="shrink-0">
-                          {user.hasAllAccess ? (
-                            <span className="inline-flex items-center gap-1 text-[10px] font-extrabold px-2.5 py-1 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
-                              <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-                              <span>All-Access Active</span>
-                            </span>
-                          ) : (
-                            <span className="inline-flex items-center gap-1 text-[10px] font-medium px-2.5 py-1 rounded-lg bg-zinc-800 text-zinc-400 border border-zinc-700">
-                              <span>Standard Pass</span>
-                            </span>
-                          )}
+                        <div className="flex items-center gap-1.5 shrink-0 flex-wrap">
+                          <span className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-1 rounded-lg border ${
+                            userExpired
+                              ? 'bg-rose-950/60 text-rose-300 border-rose-500/30'
+                              : user.hasAllAccess
+                                ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                                : mergedUserCourses.length > 0
+                                  ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30'
+                                  : 'bg-zinc-800 text-zinc-400 border-zinc-700'
+                          }`}>
+                            {userExpired ? 'Expired' : user.hasAllAccess ? 'All-Access Active' : mergedUserCourses.length > 0 ? 'Course Pass' : 'Free Tier'}
+                          </span>
                         </div>
                       </div>
 
                       {/* Touch-Friendly Action Buttons Row */}
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
+                        {/* Grant Access Manually Button */}
+                        <button
+                          type="button"
+                          onClick={() => openManualGrantModal({ user })}
+                          className="w-full min-h-[40px] px-3 py-2 rounded-xl bg-gradient-to-r from-emerald-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 text-white text-xs font-extrabold shadow-md flex items-center justify-center gap-1.5 transition-all cursor-pointer"
+                        >
+                          <Unlock className="w-3.5 h-3.5" />
+                          <span>Grant Access</span>
+                        </button>
+
                         {/* Manage Role Button */}
                         <button
                           type="button"
                           onClick={() => handleOpenManageRoleSheet(user)}
-                          className="w-full min-h-[44px] px-3.5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 active:scale-[0.98] text-white text-xs font-bold shadow-md shadow-blue-600/25 flex items-center justify-center gap-2 transition-all cursor-pointer"
+                          className="w-full min-h-[40px] px-3 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 active:scale-[0.98] text-white text-xs font-bold shadow-md shadow-blue-600/25 flex items-center justify-center gap-1.5 transition-all cursor-pointer"
                         >
                           <ShieldCheck className="w-4 h-4 text-cyan-300" />
                           <span>Manage Role</span>
@@ -2270,7 +2570,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
                           type="button"
                           onClick={() => handleToggleUserAllAccess(user)}
                           disabled={operatingIds[user.uid]}
-                          className={`w-full min-h-[44px] px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-2 cursor-pointer ${
+                          className={`w-full min-h-[40px] px-3 py-2 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
                             operatingIds[user.uid]
                               ? 'opacity-60 cursor-not-allowed bg-zinc-800 text-zinc-500'
                               : user.hasAllAccess
@@ -2288,10 +2588,26 @@ export const AdminView: React.FC<AdminViewProps> = ({
                           ) : (
                             <>
                               <Crown className="w-3.5 h-3.5 text-amber-400" />
-                              <span>Grant All-Access Pass</span>
+                              <span>All-Access Pass</span>
                             </>
                           )}
                         </button>
+
+                        {/* Suspend / Reactivate Account */}
+                        {!isUserOwner && (
+                          <button
+                            type="button"
+                            onClick={() => void handleToggleSuspension(user)}
+                            className={`w-full min-h-[40px] px-3 py-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
+                              userSuspended
+                                ? 'bg-emerald-950/70 hover:bg-emerald-900/80 text-emerald-300 border border-emerald-500/40'
+                                : 'bg-rose-950/70 hover:bg-rose-900/80 text-rose-300 border border-rose-500/40'
+                            }`}
+                          >
+                            {userSuspended ? <UserCheck className="w-3.5 h-3.5" /> : <UserX className="w-3.5 h-3.5" />}
+                            <span>{userSuspended ? 'Reactivate' : 'Suspend'}</span>
+                          </button>
+                        )}
                       </div>
 
                       {/* Category Access Controls (Vertically Stacked Mobile Cards) */}
@@ -2330,7 +2646,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
                         {/* Responsive Category Access Cards */}
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                           {categories.map((cat) => {
-                            const hasCat = user.hasAllAccess || user.allowedCategories?.includes(cat.id);
+                            const hasCat = user.hasAllAccess || mergedUserCourses.includes(cat.id);
                             const isTogglingThis = categoryToggling[`${user.uid}_${cat.id}`];
 
                             return (
@@ -2566,36 +2882,93 @@ export const AdminView: React.FC<AdminViewProps> = ({
         )}
 
         {/* ======================================================== */}
-        {/* TAB 9: PAYMENT PROOFS                                    */}
+        {/* TAB 9: PAYMENT PROOFS & MANUAL ACCESS                    */}
         {/* ======================================================== */}
         {activeTab === 'payments' && canVerifyPayments && (
           <div className="space-y-4 animate-in fade-in duration-150">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
               <div>
-                <h2 className="text-lg font-bold text-white">Payment Proof Submissions</h2>
+                <h2 className="text-lg font-bold text-white">Payment Screenshot Review & Verification</h2>
                 <p className="text-xs text-zinc-400">
-                  Verify user UPI payment screenshots, copy UTR references, and track Telegram bot alert delivery.
+                  Inspect UPI payment screenshots, verify UTRs, approve/reject payments, or manually unlock courses directly.
                 </p>
               </div>
-              {canManageTelegram && (
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
                 <button
                   type="button"
-                  onClick={() => setActiveTab('telegram')}
-                  className="self-start sm:self-auto px-3 py-1.5 rounded-xl bg-[#090D16] border border-cyan-500/30 text-cyan-300 hover:text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+                  onClick={() => openManualGrantModal()}
+                  className="min-h-[38px] px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-emerald-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 text-white text-xs font-extrabold flex items-center gap-1.5 shadow-md shadow-emerald-600/25 cursor-pointer whitespace-nowrap"
                 >
-                  <Bot className="w-3.5 h-3.5" />
-                  <span>Telegram Bots</span>
+                  <Unlock className="w-3.5 h-3.5" />
+                  <span>MANUALLY GRANT ACCESS</span>
                 </button>
-              )}
+                {canManageTelegram && (
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('telegram')}
+                    className="min-h-[38px] px-3 py-1.5 rounded-xl bg-[#090D16] border border-cyan-500/30 text-cyan-300 hover:text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+                  >
+                    <Bot className="w-3.5 h-3.5" />
+                    <span>Telegram Bots</span>
+                  </button>
+                )}
+              </div>
             </div>
 
-            {paymentRequests.length === 0 ? (
+            {/* Search & Status Filter Controls */}
+            <div className="space-y-2">
+              <div className="relative w-full">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500" />
+                <input
+                  type="text"
+                  value={paymentSearch}
+                  onChange={e => setPaymentSearch(e.target.value)}
+                  placeholder="Search by user name, email, course, UTR, or request ID..."
+                  className="w-full pl-9 pr-9 py-2.5 rounded-xl bg-[#090D16] border border-blue-500/20 text-xs text-white placeholder-zinc-500 outline-none focus:border-cyan-400 transition-colors"
+                />
+                {paymentSearch && (
+                  <button
+                    type="button"
+                    onClick={() => setPaymentSearch('')}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 p-1 rounded-full text-zinc-400 hover:text-white"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+
+              <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar py-0.5">
+                {[
+                  { id: 'all', label: `All (${paymentRequests.length})` },
+                  { id: 'pending', label: `Pending (${paymentRequests.filter(p => p.status === 'pending').length})` },
+                  { id: 'approved', label: `Approved (${paymentRequests.filter(p => p.status === 'approved').length})` },
+                  { id: 'rejected', label: `Rejected (${paymentRequests.filter(p => p.status === 'rejected').length})` }
+                ].map(f => (
+                  <button
+                    key={f.id}
+                    type="button"
+                    onClick={() => setPaymentStatusFilter(f.id as any)}
+                    className={`px-3 py-1.5 rounded-xl text-xs font-bold whitespace-nowrap cursor-pointer ${
+                      paymentStatusFilter === f.id
+                        ? 'bg-blue-600 text-white shadow-md shadow-blue-600/30'
+                        : 'bg-[#090D16] border border-zinc-800 text-zinc-400 hover:text-white'
+                    }`}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {filteredPaymentRequests.length === 0 ? (
               <div className="p-8 rounded-2xl bg-[#090D16] border border-zinc-800 text-center text-xs text-zinc-400">
-                No payment proof submissions yet.
+                {paymentRequests.length === 0
+                  ? 'No payment proof submissions yet.'
+                  : 'No payment requests match your current search or filter.'}
               </div>
             ) : (
               <div className="space-y-2.5">
-                {paymentRequests.map((req) => {
+                {filteredPaymentRequests.map((req) => {
                   const job = paymentJobsById[req.id];
                   const hasFailedDelivery =
                     job && (job.overallStatus === 'FAILED' || job.overallStatus === 'PARTIAL_FAILURE');
@@ -2603,19 +2976,22 @@ export const AdminView: React.FC<AdminViewProps> = ({
                   return (
                     <div
                       key={req.id}
-                      className="p-3.5 rounded-2xl bg-[#090D16] border border-blue-500/15 flex flex-col md:flex-row items-start md:items-center justify-between gap-3"
+                      className="p-3.5 rounded-2xl bg-[#090D16] border border-blue-500/15 flex flex-col gap-3"
                     >
-                      <div className="flex items-start sm:items-center gap-3 min-w-0">
+                      <div className="flex items-start gap-3 min-w-0">
                         <img
                           src={req.proofUrl}
                           alt="Proof Thumbnail"
-                          onClick={() => setViewingProof(req)}
-                          className="w-14 h-14 rounded-xl object-cover border border-zinc-700 cursor-pointer hover:scale-105 transition-transform shrink-0"
+                          onClick={() => {
+                            setProofZoom(1);
+                            setViewingProof(req);
+                          }}
+                          className="w-16 h-16 rounded-xl object-cover border border-zinc-700 cursor-pointer hover:scale-105 transition-transform shrink-0 bg-black"
                         />
-                        <div className="min-w-0 space-y-1">
+                        <div className="min-w-0 flex-1 space-y-1">
                           <div className="flex flex-wrap items-center gap-2">
                             <span className="text-xs font-bold text-white">{req.userName}</span>
-                            <span className="text-[11px] text-zinc-400 truncate">{req.userEmail}</span>
+                            <span className="text-[11px] text-zinc-400 break-all">{req.userEmail}</span>
                             <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
                               req.status === 'approved'
                                 ? 'bg-emerald-950 text-emerald-300 border border-emerald-500/30'
@@ -2653,7 +3029,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
                           <span className="text-[11px] text-zinc-300 font-mono block tabular-nums">
                             ₹{req.amount} • UPI • {req.planType === 'all_access' ? 'All-Access Pass' : req.categoryName}
                           </span>
-                          <div className="flex flex-wrap items-center gap-2 text-[10px] text-zinc-500 font-mono">
+                          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] text-zinc-500 font-mono">
                             <span>ID: {req.id}</span>
                             <span>•</span>
                             <span>UTR: {req.utr}</span>
@@ -2663,11 +3039,56 @@ export const AdminView: React.FC<AdminViewProps> = ({
                         </div>
                       </div>
 
-                      <div className="flex flex-wrap items-center gap-2 shrink-0 w-full md:w-auto">
+                      <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-zinc-800/80">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setProofZoom(1);
+                            setViewingProof(req);
+                          }}
+                          className="min-h-[36px] px-3 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold cursor-pointer inline-flex items-center gap-1.5"
+                        >
+                          <Eye className="w-3.5 h-3.5" />
+                          <span>View Screenshot</span>
+                        </button>
+
+                        {req.status === 'pending' && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => void handleResolvePayment(req.id, 'approved')}
+                              className="min-h-[36px] px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold cursor-pointer inline-flex items-center gap-1.5"
+                            >
+                              <Check className="w-3.5 h-3.5" />
+                              <span>Approve Payment</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setProofZoom(1);
+                                setViewingProof(req);
+                              }}
+                              className="min-h-[36px] px-3 py-1.5 rounded-xl bg-rose-950 hover:bg-rose-900 border border-rose-500/40 text-rose-300 text-xs font-bold cursor-pointer inline-flex items-center gap-1.5"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                              <span>Reject Payment</span>
+                            </button>
+                          </>
+                        )}
+
+                        <button
+                          type="button"
+                          onClick={() => openManualGrantModal({ payment: req })}
+                          className="min-h-[36px] px-3 py-1.5 rounded-xl bg-emerald-950/80 hover:bg-emerald-900/80 border border-emerald-500/40 text-emerald-300 text-xs font-bold cursor-pointer inline-flex items-center gap-1.5"
+                        >
+                          <Unlock className="w-3.5 h-3.5" />
+                          <span>Grant Access Manually</span>
+                        </button>
+
                         <button
                           type="button"
                           onClick={() => void handleCopyUtr(req.utr)}
-                          className="min-h-[36px] px-2.5 py-1.5 rounded-xl bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-zinc-300 text-xs font-semibold cursor-pointer inline-flex items-center gap-1"
+                          className="min-h-[36px] px-2.5 py-1.5 rounded-xl bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-zinc-300 text-xs font-semibold cursor-pointer inline-flex items-center gap-1 ml-auto"
                         >
                           <Copy className="w-3.5 h-3.5" />
                           <span>Copy UTR</span>
@@ -2684,14 +3105,6 @@ export const AdminView: React.FC<AdminViewProps> = ({
                             <span>Retry TG</span>
                           </button>
                         )}
-
-                        <button
-                          type="button"
-                          onClick={() => setViewingProof(req)}
-                          className="min-h-[36px] px-3 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold cursor-pointer ml-auto md:ml-0"
-                        >
-                          View Receipt
-                        </button>
                       </div>
                     </div>
                   );
@@ -3660,76 +4073,136 @@ export const AdminView: React.FC<AdminViewProps> = ({
       )}
 
       {/* ======================================================== */}
-      {/* MODAL: VIEW PROOF                                        */}
+      {/* MODAL: FULL-SCREEN ZOOMABLE PAYMENT PROOF PREVIEW        */}
       {/* ======================================================== */}
       {viewingProof && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/90 overflow-y-auto">
-          <div className="relative w-full max-w-md bg-[#0B0F19] border border-blue-500/30 rounded-2xl p-4 sm:p-5 text-white space-y-3 my-6">
-            <button onClick={() => setViewingProof(null)} className="absolute top-3.5 right-3.5 p-1.5 rounded-lg bg-zinc-800 text-zinc-400 hover:text-white cursor-pointer">
-              <X className="w-4 h-4" />
-            </button>
-
-            <div>
-              <h3 className="font-bold text-sm pr-8">{viewingProof.userName}</h3>
-              <p className="text-[11px] text-zinc-400">{viewingProof.userEmail}</p>
-            </div>
-
-            <div className="grid grid-cols-2 gap-2 p-2.5 rounded-xl bg-[#05070D] border border-zinc-800 text-[11px]">
-              <div>
-                <span className="text-zinc-500 block">Plan / Course</span>
-                <span className="font-semibold text-white">
-                  {viewingProof.planType === 'all_access' ? 'All-Access Pass' : viewingProof.categoryName}
+        <div className="fixed inset-0 z-50 flex flex-col bg-black/95 backdrop-blur-sm">
+          {/* Top Bar with Metadata & Zoom Controls */}
+          <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 bg-[#090D16] border-b border-blue-500/20 shrink-0">
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <h3 className="font-bold text-sm text-white truncate">{viewingProof.userName}</h3>
+                <span className={`text-[10px] font-bold px-2 py-0.5 rounded uppercase ${
+                  viewingProof.status === 'approved'
+                    ? 'bg-emerald-950 text-emerald-300 border border-emerald-500/30'
+                    : viewingProof.status === 'rejected'
+                      ? 'bg-rose-950 text-rose-300 border border-rose-500/30'
+                      : 'bg-amber-950 text-amber-300 border border-amber-500/30'
+                }`}>
+                  {viewingProof.status}
                 </span>
               </div>
-              <div>
-                <span className="text-zinc-500 block">Amount & Method</span>
-                <span className="font-mono font-bold text-emerald-300">₹{viewingProof.amount} • UPI</span>
-              </div>
-              <div className="col-span-2 flex items-center justify-between gap-2 pt-1 border-t border-zinc-800/80">
-                <div className="min-w-0">
-                  <span className="text-zinc-500 block">Transaction ID / UTR</span>
-                  <span className="font-mono text-cyan-300 break-all">{viewingProof.utr}</span>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => void handleCopyUtr(viewingProof.utr)}
-                  className="px-2.5 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-[11px] font-semibold inline-flex items-center gap-1 shrink-0 cursor-pointer"
-                >
-                  <Copy className="w-3 h-3" />
-                  <span>Copy</span>
-                </button>
-              </div>
+              <p className="text-[11px] text-zinc-400 truncate">
+                {viewingProof.userEmail} • ₹{viewingProof.amount} •{' '}
+                {viewingProof.planType === 'all_access' ? 'All-Access Pass' : viewingProof.categoryName} •{' '}
+                UTR: <span className="font-mono text-cyan-300">{viewingProof.utr}</span>
+              </p>
             </div>
 
-            <img src={viewingProof.proofUrl} alt="Receipt" className="max-h-72 w-full object-contain rounded-xl border border-zinc-800 bg-black" />
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => setProofZoom(z => Math.max(1, Number((z - 0.5).toFixed(2))))}
+                disabled={proofZoom <= 1}
+                className="p-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 disabled:opacity-40 cursor-pointer"
+                title="Zoom Out"
+              >
+                <ZoomOut className="w-4 h-4" />
+              </button>
+              <span className="text-xs font-mono text-cyan-300 px-2 min-w-[48px] text-center">
+                {Math.round(proofZoom * 100)}%
+              </span>
+              <button
+                type="button"
+                onClick={() => setProofZoom(z => Math.min(3, Number((z + 0.5).toFixed(2))))}
+                disabled={proofZoom >= 3}
+                className="p-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 disabled:opacity-40 cursor-pointer"
+                title="Zoom In"
+              >
+                <ZoomIn className="w-4 h-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setProofZoom(1)}
+                className="p-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 cursor-pointer"
+                title="Reset Zoom"
+              >
+                <RotateCcw className="w-4 h-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleCopyUtr(viewingProof.utr)}
+                className="px-2.5 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-semibold inline-flex items-center gap-1 cursor-pointer"
+              >
+                <Copy className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Copy UTR</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setProofZoom(1);
+                  setViewingProof(null);
+                }}
+                className="p-2 rounded-lg bg-rose-950/70 hover:bg-rose-900 text-rose-200 cursor-pointer"
+                title="Close Preview"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
 
+          {/* Zoomable Full-Screen Screenshot Canvas */}
+          <div className="flex-1 overflow-auto flex items-center justify-center p-4 bg-black">
+            <img
+              src={viewingProof.proofUrl}
+              alt="Payment Screenshot Preview"
+              onClick={() => setProofZoom(z => (z >= 2 ? 1 : Number((z + 0.5).toFixed(2))))}
+              style={{ transform: `scale(${proofZoom})`, transformOrigin: 'center center' }}
+              className="max-h-full max-w-full object-contain rounded-xl border border-zinc-800 transition-transform duration-150 cursor-zoom-in"
+            />
+          </div>
+
+          {/* Bottom Review & Manual Grant Action Bar */}
+          <div className="p-3 sm:p-4 bg-[#090D16] border-t border-blue-500/20 space-y-2.5 shrink-0">
             {viewingProof.status === 'pending' && (
-              <div className="space-y-2.5 pt-1">
-                <input
-                  type="text"
-                  value={rejectNote}
-                  onChange={e => setRejectNote(e.target.value)}
-                  placeholder="Optional admin verification note..."
-                  className="w-full px-3 py-2 rounded-xl bg-[#05070D] border border-zinc-800 text-xs text-white outline-none"
-                />
-                <div className="flex gap-2">
+              <input
+                type="text"
+                value={rejectNote}
+                onChange={e => setRejectNote(e.target.value)}
+                placeholder="Optional verification or rejection note..."
+                className="w-full px-3 py-2 rounded-xl bg-[#05070D] border border-zinc-800 text-xs text-white outline-none focus:border-cyan-400"
+              />
+            )}
+            <div className="flex flex-wrap items-center gap-2">
+              {viewingProof.status === 'pending' && (
+                <>
                   <button
                     type="button"
                     onClick={() => handleResolvePayment(viewingProof.id, 'approved')}
-                    className="flex-1 min-h-[40px] py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs cursor-pointer shadow-md"
+                    className="flex-1 min-w-[130px] min-h-[42px] py-2 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs cursor-pointer shadow-md inline-flex items-center justify-center gap-1.5"
                   >
-                    Approve & Unlock
+                    <Check className="w-4 h-4" />
+                    <span>Approve Payment</span>
                   </button>
                   <button
                     type="button"
                     onClick={() => handleResolvePayment(viewingProof.id, 'rejected')}
-                    className="flex-1 min-h-[40px] py-2 rounded-xl bg-rose-950 hover:bg-rose-900 text-rose-300 border border-rose-500/40 font-bold text-xs cursor-pointer"
+                    className="flex-1 min-w-[130px] min-h-[42px] py-2 px-3 rounded-xl bg-rose-950 hover:bg-rose-900 text-rose-300 border border-rose-500/40 font-bold text-xs cursor-pointer inline-flex items-center justify-center gap-1.5"
                   >
-                    Reject
+                    <X className="w-4 h-4" />
+                    <span>Reject Payment</span>
                   </button>
-                </div>
-              </div>
-            )}
+                </>
+              )}
+              <button
+                type="button"
+                onClick={() => openManualGrantModal({ payment: viewingProof })}
+                className="flex-1 min-w-[160px] min-h-[42px] py-2 px-4 rounded-xl bg-gradient-to-r from-emerald-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 text-white font-extrabold text-xs cursor-pointer shadow-md inline-flex items-center justify-center gap-1.5"
+              >
+                <Unlock className="w-4 h-4" />
+                <span>MANUALLY GRANT ACCESS</span>
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -4043,6 +4516,293 @@ export const AdminView: React.FC<AdminViewProps> = ({
                 <button
                   type="button"
                   onClick={() => setEditingCategory(null)}
+                  className="px-4 py-2.5 rounded-xl bg-zinc-800 text-zinc-300 hover:text-white text-xs font-semibold cursor-pointer"
+                >
+                  Cancel
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ======================================================== */}
+      {/* MODAL: MANUALLY GRANT COURSE ACCESS                      */}
+      {/* ======================================================== */}
+      {isManualGrantOpen && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-3 sm:p-4 bg-black/90 overflow-y-auto">
+          <div className="relative w-full max-w-lg bg-[#0B0F19] border border-emerald-500/35 rounded-2xl p-4 sm:p-6 text-white space-y-4 my-6 shadow-2xl">
+            <button
+              type="button"
+              onClick={() => setIsManualGrantOpen(false)}
+              className="absolute top-3.5 right-3.5 p-1.5 rounded-lg bg-zinc-800 text-zinc-400 hover:text-white cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+            </button>
+
+            <div className="pr-8">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 flex items-center justify-center shrink-0">
+                  <Unlock className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="font-extrabold text-sm sm:text-base text-white">
+                    Manual Course Access Grant
+                  </h3>
+                  <p className="text-[11px] text-zinc-400">
+                    Immediately unlock selected courses or All-Access Pass for any registered user.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <form onSubmit={handleSubmitManualGrant} className="space-y-3.5 text-xs">
+              {/* Target User Selector */}
+              <div className="space-y-1.5">
+                <label className="block text-zinc-300 font-semibold">Select Registered User *</label>
+                <input
+                  type="text"
+                  value={manualGrantUserSearch}
+                  onChange={e => setManualGrantUserSearch(e.target.value)}
+                  placeholder="Filter users by name or email..."
+                  className="w-full px-3 py-2 rounded-xl bg-[#05070D] border border-zinc-800 text-white placeholder-zinc-500 outline-none focus:border-cyan-400"
+                />
+                <select
+                  required
+                  value={manualGrantUserUid}
+                  onChange={e => {
+                    const uid = e.target.value;
+                    setManualGrantUserUid(uid);
+                    const picked = users.find(u => u.uid === uid);
+                    if (picked && !manualGrantPaymentId) {
+                      setManualGrantAllAccess(Boolean(picked.hasAllAccess));
+                      setManualGrantCourseIds(
+                        Array.from(new Set([...(picked.allowedCategories || []), ...(picked.assignedCourses || [])]))
+                      );
+                    }
+                  }}
+                  className="w-full px-3 py-2.5 rounded-xl bg-[#05070D] border border-blue-500/25 text-white outline-none"
+                >
+                  <option value="">-- Choose a user --</option>
+                  {users
+                    .filter(u => {
+                      if (!manualGrantUserSearch.trim()) return true;
+                      const q = manualGrantUserSearch.trim().toLowerCase();
+                      return (
+                        u.displayName.toLowerCase().includes(q) ||
+                        u.email.toLowerCase().includes(q) ||
+                        u.uid.toLowerCase().includes(q)
+                      );
+                    })
+                    .map(u => (
+                      <option key={u.uid} value={u.uid}>
+                        {u.displayName} ({u.email || u.phoneNumber || u.uid})
+                      </option>
+                    ))}
+                </select>
+              </div>
+
+              {/* Access Scope Selector */}
+              <div className="p-3 rounded-xl bg-[#05070D] border border-zinc-800 space-y-2.5">
+                <label className="flex items-center justify-between gap-2 cursor-pointer">
+                  <div>
+                    <span className="font-bold text-white block">Grant Universal All-Access Pass</span>
+                    <span className="text-[10px] text-zinc-400">Unlocks every current and future course category + PDFs.</span>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={manualGrantAllAccess}
+                    onChange={e => setManualGrantAllAccess(e.target.checked)}
+                    className="w-4 h-4 rounded border-zinc-700 text-emerald-500"
+                  />
+                </label>
+
+                <div className="pt-2 border-t border-zinc-800/80 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="font-semibold text-zinc-300">Individual Courses ({manualGrantCourseIds.length} selected)</span>
+                    <div className="flex items-center gap-2 text-[11px]">
+                      <button
+                        type="button"
+                        onClick={() => setManualGrantCourseIds(categories.map(c => c.id))}
+                        className="text-cyan-400 hover:text-cyan-300 font-semibold cursor-pointer"
+                      >
+                        Select All
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setManualGrantCourseIds([])}
+                        className="text-zinc-400 hover:text-white cursor-pointer"
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 max-h-40 overflow-y-auto pr-1">
+                    {categories.map(cat => {
+                      const checked = manualGrantCourseIds.includes(cat.id);
+                      return (
+                        <label
+                          key={cat.id}
+                          className={`flex items-center gap-2 p-2 rounded-lg border cursor-pointer transition-colors ${
+                            checked
+                              ? 'bg-emerald-950/40 border-emerald-500/40 text-white'
+                              : 'bg-[#090D16] border-zinc-800 text-zinc-400'
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={e => {
+                              if (e.target.checked) {
+                                setManualGrantCourseIds(prev => Array.from(new Set([...prev, cat.id])));
+                              } else {
+                                setManualGrantCourseIds(prev => prev.filter(id => id !== cat.id));
+                              }
+                            }}
+                            className="rounded border-zinc-700 text-emerald-500"
+                          />
+                          <span className="truncate font-semibold">{cat.name}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+
+                  <label className="flex items-center gap-2 text-[11px] text-zinc-400 cursor-pointer pt-1">
+                    <input
+                      type="checkbox"
+                      checked={manualGrantMergeExisting}
+                      onChange={e => setManualGrantMergeExisting(e.target.checked)}
+                      className="rounded border-zinc-700 text-cyan-500"
+                    />
+                    <span>Keep existing assigned courses (merge instead of replacing)</span>
+                  </label>
+                </div>
+              </div>
+
+              {/* Duration / Access Expiry */}
+              <div className="p-3 rounded-xl bg-[#05070D] border border-zinc-800 space-y-2.5">
+                <span className="font-semibold text-zinc-300 block">Access Duration</span>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setManualGrantDurationType('lifetime')}
+                    className={`py-2 px-3 rounded-xl font-bold text-xs border cursor-pointer ${
+                      manualGrantDurationType === 'lifetime'
+                        ? 'bg-emerald-600/20 border-emerald-500/50 text-emerald-300'
+                        : 'bg-[#090D16] border-zinc-800 text-zinc-400'
+                    }`}
+                  >
+                    Permanent / Lifetime
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setManualGrantDurationType('expiry')}
+                    className={`py-2 px-3 rounded-xl font-bold text-xs border cursor-pointer ${
+                      manualGrantDurationType === 'expiry'
+                        ? 'bg-blue-600/20 border-blue-500/50 text-cyan-300'
+                        : 'bg-[#090D16] border-zinc-800 text-zinc-400'
+                    }`}
+                  >
+                    Expiry-Based
+                  </button>
+                </div>
+
+                {manualGrantDurationType === 'expiry' && (
+                  <div className="space-y-2 pt-1">
+                    <div className="flex flex-wrap gap-1.5">
+                      {[7, 30, 90, 365].map(days => (
+                        <button
+                          key={days}
+                          type="button"
+                          onClick={() => {
+                            setManualGrantDays(days);
+                            setManualGrantCustomDate('');
+                          }}
+                          className={`px-2.5 py-1 rounded-lg text-[11px] font-bold cursor-pointer ${
+                            !manualGrantCustomDate && manualGrantDays === days
+                              ? 'bg-blue-600 text-white'
+                              : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
+                          }`}
+                        >
+                          {days} Days
+                        </button>
+                      ))}
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <label className="block text-[10px] text-zinc-400 mb-1">Custom Days</label>
+                        <input
+                          type="number"
+                          min={1}
+                          value={manualGrantDays}
+                          onChange={e => {
+                            setManualGrantDays(Math.max(1, Number(e.target.value) || 1));
+                            setManualGrantCustomDate('');
+                          }}
+                          className="w-full px-2.5 py-1.5 rounded-lg bg-[#090D16] border border-zinc-800 text-white font-mono outline-none"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[10px] text-zinc-400 mb-1">Or Exact Date</label>
+                        <input
+                          type="date"
+                          value={manualGrantCustomDate}
+                          onChange={e => setManualGrantCustomDate(e.target.value)}
+                          className="w-full px-2.5 py-1.5 rounded-lg bg-[#090D16] border border-zinc-800 text-white font-mono outline-none"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {manualGrantPaymentId && (
+                <label className="flex items-center gap-2 p-2.5 rounded-xl bg-amber-950/30 border border-amber-500/30 text-amber-200 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={manualGrantApprovePayment}
+                    onChange={e => setManualGrantApprovePayment(e.target.checked)}
+                    className="rounded border-amber-500 text-amber-500"
+                  />
+                  <span className="text-[11px] font-semibold">
+                    Also mark linked payment request ({manualGrantPaymentId}) as approved
+                  </span>
+                </label>
+              )}
+
+              <div>
+                <label className="block text-zinc-300 mb-1 font-semibold">Admin Audit Note (Optional)</label>
+                <input
+                  type="text"
+                  value={manualGrantNote}
+                  onChange={e => setManualGrantNote(e.target.value)}
+                  placeholder="e.g. Verified WhatsApp screenshot / Scholarship grant"
+                  className="w-full px-3 py-2 rounded-xl bg-[#05070D] border border-zinc-800 text-white placeholder-zinc-500 outline-none focus:border-cyan-400"
+                />
+              </div>
+
+              <div className="flex gap-2 pt-2">
+                <button
+                  type="submit"
+                  disabled={isSubmittingManualGrant}
+                  className="flex-1 min-h-[42px] py-2.5 px-4 rounded-xl bg-gradient-to-r from-emerald-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 text-white font-extrabold text-xs shadow-md cursor-pointer disabled:opacity-60 flex items-center justify-center gap-2"
+                >
+                  {isSubmittingManualGrant ? (
+                    <>
+                      <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                      <span>Granting Access...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Unlock className="w-4 h-4" />
+                      <span>Confirm & Unlock Now</span>
+                    </>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIsManualGrantOpen(false)}
                   className="px-4 py-2.5 rounded-xl bg-zinc-800 text-zinc-300 hover:text-white text-xs font-semibold cursor-pointer"
                 >
                   Cancel
