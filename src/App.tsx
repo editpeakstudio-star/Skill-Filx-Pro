@@ -25,7 +25,6 @@ import {
   subscribeToAuditLogs,
   DEFAULT_SETTINGS,
   logoutUser,
-  getWhatsAppUrl,
   hasCourseAccess,
   UNWANTED_DEMO_VIDEO_IDS,
   UNWANTED_DEMO_PDF_IDS
@@ -38,13 +37,13 @@ import { AuthModal } from './components/AuthModal';
 import { VideoPlayerModal } from './components/VideoPlayerModal';
 import { VideoDetailsModal } from './components/VideoDetailsModal';
 import { PdfViewerModal } from './components/PdfViewerModal';
+import { SkillFlixAiAssistant } from './components/SkillFlixAiAssistant';
 import { HomeView } from './views/HomeView';
 import { CategoryDetailView } from './views/CategoryDetailView';
 import { VideosView } from './views/VideosView';
 import { PdfsView } from './views/PdfsView';
 import { ProfileView } from './views/ProfileView';
 import { AdminView } from './views/AdminView';
-import { MessageCircle, Crown, Shield } from 'lucide-react';
 
 function AppContent() {
   const { showToast } = useToast();
@@ -346,30 +345,13 @@ function AppContent() {
         )}
       </main>
 
-      {/* Floating WhatsApp/Telegram Support Button (Dynamically formatted) */}
-      {(settings.paymentPhone || settings.supportWhatsapp) ? (
-        <a
-          href={getWhatsAppUrl(settings.paymentPhone || settings.supportWhatsapp, 'Hi Skill-Flix Support, I need help with my course access and payment.')}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="fixed bottom-20 sm:bottom-6 left-4 sm:left-6 z-40 flex items-center gap-2 px-3.5 py-2.5 rounded-full bg-emerald-600 hover:bg-emerald-500 text-white shadow-xl shadow-emerald-600/30 font-bold text-xs transition-all hover:scale-105"
-          title="WhatsApp Support"
-        >
-          <MessageCircle className="w-4 h-4 fill-white" />
-          <span className="hidden md:inline">WhatsApp Help</span>
-        </a>
-      ) : settings.supportTelegram ? (
-        <a
-          href={settings.supportTelegram}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="fixed bottom-20 sm:bottom-6 left-4 sm:left-6 z-40 flex items-center gap-2 px-3.5 py-2.5 rounded-full bg-sky-600 hover:bg-sky-500 text-white shadow-xl shadow-sky-600/30 font-bold text-xs transition-all hover:scale-105"
-          title="Telegram Support"
-        >
-          <MessageCircle className="w-4 h-4 fill-white" />
-          <span className="hidden md:inline">Support Channel</span>
-        </a>
-      ) : null}
+      {/* Skill-Flix AI Floating Learning Assistant */}
+      {currentView !== 'admin' && (
+        <SkillFlixAiAssistant
+          currentUser={currentUser}
+          onOpenAuth={() => setIsAuthOpen(true)}
+        />
+      )}
 
       {/* Modals */}
       <SubscribeModal

@@ -4,7 +4,8 @@ import type { Request, Response } from 'express';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { PaymentRequest, TelegramDashboardResponse } from './src/types/index.ts';
+import { fileURLToPath } from 'node:url';
+import type { AiAdminConfigUpdatePayload, PaymentRequest, TelegramDashboardResponse } from './src/types/index.ts';
 import {
   encryptBotToken,
   maskBotToken,
@@ -14,6 +15,7 @@ import {
 } from './server/telegramCrypto.ts';
 import {
   authorizeAdmin,
+  authorizeSuperAdmin,
   extractBearerToken,
   fetchFirestoreDocument,
   verifyFirebaseIdToken
@@ -35,8 +37,51 @@ import {
   sendTestPaymentNotification,
   testBotConnection
 } from './server/telegramEngine.ts';
+import {
+  AiServiceError,
+  getAsyncAiStatus,
+  handleSkillFlixAiChat,
+  testAiConfigurationConnection,
+  type AiChatRequestBody
+} from './server/skillFlixAi.ts';
+import {
+  getAdminAiConfigView,
+  saveAdminAiConfig
+} from './server/aiConfigStore.ts';
 
-const PORT = Number(process.env.PORT || 3000);
+function resolveListenPort(): number {
+  const args = process.argv.slice(2);
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--port' && args[i + 1]) {
+      const parsed = Number(args[i + 1]);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    } else if (arg.startsWith('--port=')) {
+      const parsed = Number(arg.slice('--port='.length));
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+  }
+  const envPort = Number(process.env.PORT || 0);
+  const nginxPort = Number(process.env.NGINX_PORT || 0);
+  const defaultPort = Number(process.env.DEFAULT_APP_PORT || 3000);
+  if (process.env.NODE_ENV !== 'production' && nginxPort > 0 && envPort === nginxPort) {
+    return defaultPort;
+  }
+  return envPort > 0 ? envPort : defaultPort;
+}
+
+function resolveListenHost(): string {
+  const args = process.argv.slice(2);
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--host' && args[i + 1]) return args[i + 1];
+    if (arg.startsWith('--host=')) return arg.slice('--host='.length);
+  }
+  return process.env.HOST || '0.0.0.0';
+}
+
+const PORT = resolveListenPort();
+const HOST = resolveListenHost();
 const isProduction = process.env.NODE_ENV === 'production';
 
 async function requireAdminContext(
@@ -53,6 +98,22 @@ async function requireAdminContext(
     return await authorizeAdmin(token, requiredPermission);
   } catch (err) {
     const message = (err as Error).message || 'Unauthorized';
+    const status = message.toLowerCase().includes('forbidden') ? 403 : 401;
+    res.status(status).json({ error: message });
+    return null;
+  }
+}
+
+async function requireSuperAdminContext(req: Request, res: Response) {
+  const token = extractBearerToken(req.headers.authorization);
+  if (!token) {
+    res.status(401).json({ error: 'Missing Firebase authentication token.' });
+    return null;
+  }
+  try {
+    return await authorizeSuperAdmin(token);
+  } catch (err) {
+    const message = (err as Error).message || 'Forbidden';
     const status = message.toLowerCase().includes('forbidden') ? 403 : 401;
     res.status(status).json({ error: message });
     return null;
@@ -662,6 +723,109 @@ export function createApp() {
     }
   });
 
+  // ======================================================
+  // OWNER / SUPER ADMIN: AI CONFIGURATION & API SECRETS
+  // ======================================================
+  app.get('/api/admin/ai-config', async (req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const superAdmin = await requireSuperAdminContext(req, res);
+    if (!superAdmin) return;
+
+    try {
+      const view = await getAdminAiConfigView(superAdmin.idToken);
+      res.json(view);
+    } catch (err) {
+      res.status(500).json({ error: sanitizeErrorMessage((err as Error).message) });
+    }
+  });
+
+  app.put('/api/admin/ai-config', async (req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const superAdmin = await requireSuperAdminContext(req, res);
+    if (!superAdmin) return;
+
+    const body = (req.body || {}) as Partial<AiAdminConfigUpdatePayload>;
+    const submittedKey = typeof body.GEMINI_API_KEY === 'string' ? body.GEMINI_API_KEY.trim() : '';
+
+    try {
+      const updated = await saveAdminAiConfig(superAdmin, body);
+      res.json(updated);
+    } catch (err) {
+      let msg = sanitizeErrorMessage((err as Error).message);
+      if (submittedKey) {
+        msg = msg.split(submittedKey).join('[REDACTED_KEY]');
+      }
+      const status =
+        msg.toLowerCase().includes('must be') || msg.toLowerCase().includes('invalid') ? 400 : 500;
+      res.status(status).json({ error: msg });
+    }
+  });
+
+  app.post('/api/admin/ai-config/test', async (req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const superAdmin = await requireSuperAdminContext(req, res);
+    if (!superAdmin) return;
+
+    try {
+      const outcome = await testAiConfigurationConnection(superAdmin.idToken);
+      res.json(outcome);
+    } catch (err) {
+      res.status(500).json({
+        success: false,
+        provider: 'unknown',
+        model: 'unknown',
+        latencyMs: 0,
+        message: sanitizeErrorMessage((err as Error).message)
+      });
+    }
+  });
+
+  // ======================================================
+  // SKILL-FLIX AI LEARNING ASSISTANT (Server-Side Free Tier)
+  // ======================================================
+  app.get('/api/ai/status', async (_req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const status = await getAsyncAiStatus();
+    res.json(status);
+  });
+
+  app.post('/api/ai/chat', async (req: Request, res: Response) => {
+    const idToken = extractBearerToken(req.headers.authorization);
+    if (!idToken) {
+      res.status(401).json({
+        code: 'AUTH_REQUIRED',
+        error: 'Please sign in to your Skill-Flix account to chat with Skill-Flix AI.'
+      });
+      return;
+    }
+
+    try {
+      const caller = await verifyFirebaseIdToken(idToken);
+      const body = (req.body || {}) as AiChatRequestBody;
+      const outcome = await handleSkillFlixAiChat(caller, body);
+      res.json(outcome);
+    } catch (err: any) {
+      if (err instanceof AiServiceError) {
+        res.status(err.status).json({
+          code: err.code,
+          error: err.message,
+          quota: err.quota
+        });
+        return;
+      }
+      const message = sanitizeErrorMessage((err as Error)?.message || 'Authentication failed.');
+      const lower = message.toLowerCase();
+      const status =
+        lower.includes('expired') || lower.includes('token') || lower.includes('authentication')
+          ? 401
+          : 500;
+      res.status(status).json({
+        code: status === 401 ? 'INVALID_AUTH_TOKEN' : 'AI_INTERNAL_ERROR',
+        error: message
+      });
+    }
+  });
+
   return app;
 }
 
@@ -669,12 +833,41 @@ async function startServer() {
   const app = createApp();
 
   if (!isProduction) {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa'
+    let viteMiddleware: express.RequestHandler | null = null;
+    let viteError: unknown = null;
+
+    const viteReadyPromise = import('vite')
+      .then(({ createServer: createViteServer }) =>
+        createViteServer({
+          server: {
+            middlewareMode: true,
+            hmr: process.env.DISABLE_HMR === 'true' ? false : undefined
+          },
+          appType: 'spa'
+        })
+      )
+      .then(vite => {
+        viteMiddleware = vite.middlewares;
+      })
+      .catch(err => {
+        viteError = err;
+        console.error('Failed to initialize Vite dev middleware:', err);
+      });
+
+    app.use(async (req, res, next) => {
+      if (!viteMiddleware && !viteError) {
+        await viteReadyPromise;
+      }
+      if (viteMiddleware) {
+        viteMiddleware(req, res, next);
+        return;
+      }
+      if (viteError) {
+        res.status(500).send('Vite dev middleware failed to initialize.');
+        return;
+      }
+      next();
     });
-    app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
     if (fs.existsSync(distDir)) {
@@ -685,13 +878,23 @@ async function startServer() {
     }
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Skill-Flix server running at http://0.0.0.0:${PORT}`);
+  const server = app.listen(PORT, HOST, () => {
+    console.log(`Skill-Flix server running at http://${HOST}:${PORT}`);
+  });
+
+  server.on('error', err => {
+    console.error(`Failed to bind server on ${HOST}:${PORT}:`, err);
+    process.exit(1);
   });
 }
 
 // Only start HTTP listener when executed as entry module
-const isMainModule = process.argv[1] && path.resolve(process.argv[1]) === path.resolve('server.ts');
+const currentFile = fileURLToPath(import.meta.url);
+const entryFile = process.argv[1] ? path.resolve(process.argv[1]) : '';
+const isMainModule =
+  Boolean(entryFile) &&
+  (entryFile === currentFile ||
+    (fs.existsSync(entryFile) && fs.realpathSync(entryFile) === fs.realpathSync(currentFile)));
 if (isMainModule) {
   void startServer();
 }

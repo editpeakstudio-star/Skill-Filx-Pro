@@ -8,6 +8,7 @@ import {
 } from './crypto';
 import {
   authorizeAdmin,
+  authorizeSuperAdmin,
   deleteFirestoreDoc,
   getFirestoreAuthToken,
   getFirestoreDoc,
@@ -27,6 +28,8 @@ import {
   testBotConnection,
   toPublicBot
 } from './telegram';
+import { getWorkerAiStatus, handleWorkerAiChat, testWorkerAiConnection } from './ai';
+import { getWorkerAdminAiConfigView, saveWorkerAdminAiConfig } from './aiConfig';
 import {
   HttpError,
   type PaymentRequestDoc,
@@ -621,6 +624,40 @@ async function handleRequest(request: Request, env: WorkerEnv): Promise<Response
   if (pathname === '/api/admin/sync-users' && method === 'POST') {
     await authorizeAdmin(authHeader, env, 'students.manage');
     const result = await syncFirebaseAuthUsersToFirestore(env);
+    return jsonResponse(request, env, result);
+  }
+
+  // GET /api/admin/ai-config (Owner / Super Admin ONLY)
+  if (pathname === '/api/admin/ai-config' && method === 'GET') {
+    const superAdmin = await authorizeSuperAdmin(authHeader, env);
+    const view = await getWorkerAdminAiConfigView(env, superAdmin);
+    return jsonResponse(request, env, view);
+  }
+
+  // PUT /api/admin/ai-config (Owner / Super Admin ONLY)
+  if (pathname === '/api/admin/ai-config' && method === 'PUT') {
+    const superAdmin = await authorizeSuperAdmin(authHeader, env);
+    const body = await readJsonBody<Record<string, unknown>>(request);
+    const view = await saveWorkerAdminAiConfig(env, superAdmin, body);
+    return jsonResponse(request, env, view);
+  }
+
+  // POST /api/admin/ai-config/test (Owner / Super Admin ONLY)
+  if (pathname === '/api/admin/ai-config/test' && method === 'POST') {
+    const superAdmin = await authorizeSuperAdmin(authHeader, env);
+    const result = await testWorkerAiConnection(env, superAdmin);
+    return jsonResponse(request, env, result);
+  }
+
+  // GET /api/ai/status
+  if (pathname === '/api/ai/status' && method === 'GET') {
+    return jsonResponse(request, env, await getWorkerAiStatus(env));
+  }
+
+  // POST /api/ai/chat
+  if (pathname === '/api/ai/chat' && method === 'POST') {
+    const body = await readJsonBody<{ message?: unknown; history?: unknown }>(request);
+    const result = await handleWorkerAiChat(authHeader, env, body);
     return jsonResponse(request, env, result);
   }
 

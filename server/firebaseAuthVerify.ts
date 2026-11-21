@@ -370,6 +370,99 @@ export async function authorizeAdmin(
   throw new Error('Forbidden: You do not have permission to perform this administrative action.');
 }
 
+/**
+ * Strictly authorizes ONLY the Platform Owner or a non-suspended Master Admin (Super Admin).
+ * Normal admins and students are rejected with a Forbidden error.
+ */
+export async function authorizeSuperAdmin(idToken: string): Promise<VerifiedAdminContext> {
+  const user = await verifyFirebaseIdToken(idToken);
+  const isOwner = user.email.toLowerCase() === PLATFORM_OWNER_EMAIL && user.emailVerified;
+
+  if (isOwner) {
+    return {
+      ...user,
+      role: 'owner',
+      permissions: ['telegram.manage', 'payments.verify', 'settings.manage', 'students.manage', 'master_admins.manage']
+    };
+  }
+
+  const profile = await fetchFirestoreDocument('users', user.uid, idToken);
+  if (!profile) {
+    throw new Error('Forbidden: Super Admin profile not found.');
+  }
+  if (profile.isSuspended === true || profile.accountStatus === 'suspended') {
+    throw new Error('Forbidden: Your Super Admin account is currently suspended.');
+  }
+
+  const role = typeof profile.role === 'string' ? profile.role : 'user';
+  if (role === 'master_admin') {
+    const permissions = Array.isArray(profile.permissions)
+      ? profile.permissions.filter((p): p is PermissionKey => typeof p === 'string')
+      : [];
+    return { ...user, role: 'master_admin', permissions };
+  }
+
+  throw new Error('Forbidden: AI Configuration & API Secrets are restricted strictly to the Owner and Super Admins.');
+}
+
+let cachedServiceAccountToken: { accessToken: string; expiresAt: number } | null = null;
+
+export function hasServerServiceAccount(): boolean {
+  const email = (process.env.FIREBASE_CLIENT_EMAIL || '').trim();
+  const key = (process.env.FIREBASE_PRIVATE_KEY || '').trim();
+  return Boolean(email && key);
+}
+
+export async function getServerServiceAccountToken(): Promise<string | null> {
+  const clientEmail = (process.env.FIREBASE_CLIENT_EMAIL || '').trim();
+  const privateKeyRaw = (process.env.FIREBASE_PRIVATE_KEY || '').trim().replace(/\\n/g, '\n');
+  if (!clientEmail || !privateKeyRaw) return null;
+
+  const nowMs = Date.now();
+  if (cachedServiceAccountToken && cachedServiceAccountToken.expiresAt > nowMs + 60_000) {
+    return cachedServiceAccountToken.accessToken;
+  }
+
+  const nowSec = Math.floor(nowMs / 1000);
+  const b64u = (v: string | Buffer) =>
+    Buffer.from(v).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const header = b64u(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const claims = b64u(
+    JSON.stringify({
+      iss: clientEmail,
+      sub: clientEmail,
+      aud: 'https://oauth2.googleapis.com/token',
+      scope: 'https://www.googleapis.com/auth/datastore',
+      iat: nowSec,
+      exp: nowSec + 3600
+    })
+  );
+
+  const signer = crypto.createSign('RSA-SHA256');
+  signer.update(`${header}.${claims}`);
+  signer.end();
+  const sig = b64u(signer.sign(privateKeyRaw));
+
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: `${header}.${claims}.${sig}`
+    }).toString()
+  });
+
+  if (!res.ok) return null;
+  const json = (await res.json()) as { access_token?: string; expires_in?: number };
+  if (!json.access_token) return null;
+
+  cachedServiceAccountToken = {
+    accessToken: json.access_token,
+    expiresAt: nowMs + Math.max(300, Number(json.expires_in || 3600)) * 1000
+  };
+  return cachedServiceAccountToken.accessToken;
+}
+
 export function extractBearerToken(authHeader?: string): string {
   if (!authHeader || typeof authHeader !== 'string') return '';
   const match = authHeader.match(/^Bearer\s+(.+)$/i);

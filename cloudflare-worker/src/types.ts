@@ -7,6 +7,12 @@ export interface WorkerEnv {
   TELEGRAM_API_BASE?: string;
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_CHAT_ID?: string;
+  GEMINI_API_KEY?: string;
+  GEMINI_AI_MODEL?: string;
+  GEMINI_FALLBACK_MODEL?: string;
+  AI_PROVIDER?: string;
+  AI_RATE_LIMIT_PER_MIN?: string;
+  AI_RATE_LIMIT_PER_DAY?: string;
 }
 
 export type TelegramNotificationStatus = 'SENT' | 'FAILED' | 'PENDING' | 'RETRYING';

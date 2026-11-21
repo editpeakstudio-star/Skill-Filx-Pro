@@ -307,6 +307,22 @@ service cloud.firestore {
       allow create, update: if canManageTelegram() || canVerifyPayments();
       allow delete: if owner();
     }
+    // Skill-Flix AI Configuration & Encrypted API Key Vault (Owner / Super Admin ONLY)
+    // Plaintext API keys are rejected; only AES-256-GCM encryptedGeminiApiKey + maskedGeminiApiKey allowed.
+    match /aiConfig/{id} {
+      allow read: if masterAdmin();
+      allow create, update: if masterAdmin()
+        && request.resource.data.id == id
+        && request.resource.data.aiProvider in ['gemini', 'openrouter', 'groq']
+        && request.resource.data.geminiAiModel is string
+        && request.resource.data.geminiFallbackModel is string
+        && request.resource.data.rateLimitPerMin is number
+        && request.resource.data.rateLimitPerDay is number
+        && !request.resource.data.keys().hasAny([
+          'geminiApiKey', 'GEMINI_API_KEY', 'apiKey', 'plainKey', 'rawKey', 'secret', 'openrouterApiKey', 'groqApiKey'
+        ]);
+      allow delete: if owner();
+    }
     match /{document=**} { allow read, write: if false; }
   }
 }

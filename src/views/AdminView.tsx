@@ -118,6 +118,7 @@ import {
   syncExistingAuthUsers
 } from '../services/telegramApi';
 import { TelegramBotManager, TelegramBotManagerBoundary } from '../components/TelegramBotManager';
+import { AiConfigManager, AiConfigManagerBoundary } from '../components/AiConfigManager';
 import { useToast } from '../components/Toast';
 
 interface AdminViewProps {
@@ -153,7 +154,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
   
   // Navigation tabs
   const [activeTab, setActiveTab] = useState<
-    'analytics' | 'folders' | 'videos' | 'pdfs' | 'categories' | 'users' | 'roles' | 'audit' | 'payments' | 'telegram' | 'payment-settings' | 'general'
+    'analytics' | 'folders' | 'videos' | 'pdfs' | 'categories' | 'users' | 'roles' | 'audit' | 'payments' | 'telegram' | 'ai-config' | 'payment-settings' | 'general'
   >('folders');
   const [paymentJobsById, setPaymentJobsById] = useState<Record<string, TelegramNotificationJob>>({});
   const [retryingJobId, setRetryingJobId] = useState<string | null>(null);
@@ -314,6 +315,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
     isOwner ||
     hasPermission(currentUser, 'telegram.manage') ||
     hasPermission(currentUser, 'settings.manage');
+  const canManageAiConfig = isOwner || (currentUser?.role === 'master_admin' && !isSuspended);
 
   useEffect(() => {
     if (activeTab !== 'payments' || !canVerifyPayments || !currentUser) return;
@@ -1218,6 +1220,21 @@ export const AdminView: React.FC<AdminViewProps> = ({
               </button>
             )}
 
+            {canManageAiConfig && (
+              <button
+                type="button"
+                onClick={() => setActiveTab('ai-config')}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold shrink-0 transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
+                  activeTab === 'ai-config'
+                    ? 'bg-gradient-to-r from-purple-600 to-cyan-500 text-white shadow-md shadow-purple-600/30'
+                    : 'bg-[#05070D] border border-zinc-800 text-purple-300 hover:text-white'
+                }`}
+              >
+                <Sparkles className="w-3.5 h-3.5 text-cyan-300" />
+                <span>AI Config &amp; Secrets</span>
+              </button>
+            )}
+
             {canManageSettings && (
               <button
                 type="button"
@@ -1430,6 +1447,26 @@ export const AdminView: React.FC<AdminViewProps> = ({
                   <Bot className="w-4 h-4 text-cyan-400" />
                   <span>Telegram Bot Manager</span>
                 </div>
+              </button>
+            )}
+
+            {canManageAiConfig && (
+              <button
+                type="button"
+                onClick={() => setActiveTab('ai-config')}
+                className={`w-full flex items-center justify-between px-3 py-2 rounded-xl font-semibold transition-all cursor-pointer ${
+                  activeTab === 'ai-config'
+                    ? 'bg-gradient-to-r from-purple-600 to-cyan-500 text-white shadow-md shadow-purple-600/30'
+                    : 'text-purple-300/90 hover:text-white hover:bg-zinc-800/50'
+                }`}
+              >
+                <div className="flex items-center gap-2.5">
+                  <Sparkles className="w-4 h-4 text-cyan-400" />
+                  <span>AI Config &amp; Secrets</span>
+                </div>
+                <span className="text-[9px] px-1.5 py-0.2 rounded bg-purple-950/90 text-cyan-300 font-bold">
+                  OWNER
+                </span>
               </button>
             )}
 
@@ -3179,6 +3216,17 @@ export const AdminView: React.FC<AdminViewProps> = ({
             <TelegramBotManagerBoundary>
               <TelegramBotManager />
             </TelegramBotManagerBoundary>
+          </div>
+        )}
+
+        {/* ======================================================== */}
+        {/* TAB 9C: AI CONFIGURATION & API SECRETS (OWNER/SUPERADMIN)*/}
+        {/* ======================================================== */}
+        {activeTab === 'ai-config' && canManageAiConfig && (
+          <div className="animate-in fade-in duration-150">
+            <AiConfigManagerBoundary>
+              <AiConfigManager currentUser={currentUser} />
+            </AiConfigManagerBoundary>
           </div>
         )}
 

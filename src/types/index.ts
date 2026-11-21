@@ -338,3 +338,95 @@ export interface TelegramDashboardResponse {
   settings: TelegramManagerSettings;
 }
 
+export interface AiChatMessage {
+  id: string;
+  role: 'user' | 'model';
+  text: string;
+  timestamp: string;
+  model?: string;
+  referencedCourses?: string[];
+  isError?: boolean;
+}
+
+export interface AiQuotaInfo {
+  minuteLimit: number;
+  minuteRemaining: number;
+  dailyLimit: number;
+  dailyRemaining: number;
+  resetMinuteAt: string;
+}
+
+export interface AiStatusResponse {
+  online: boolean;
+  provider: string;
+  model: string;
+  fallbackModel: string;
+  freeTier: boolean;
+  reason?: string;
+  limits: {
+    perMinute: number;
+    perDay: number;
+  };
+}
+
+export interface AiChatResponse {
+  reply: string;
+  model: string;
+  provider: string;
+  freeTier: boolean;
+  referencedCourses: string[];
+  quota: AiQuotaInfo;
+}
+
+export type AiProviderType = 'gemini' | 'openrouter' | 'groq';
+
+export type AiKeySource = 'env_secret' | 'encrypted_vault' | 'none';
+
+export interface AiAdminConfigSettings {
+  AI_PROVIDER: AiProviderType;
+  GEMINI_AI_MODEL: string;
+  GEMINI_FALLBACK_MODEL: string;
+  AI_RATE_LIMIT_PER_MIN: number;
+  AI_RATE_LIMIT_PER_DAY: number;
+}
+
+export interface AiAdminConfigView {
+  settings: AiAdminConfigSettings;
+  apiKey: {
+    isConfigured: boolean;
+    hasStoredVaultKey: boolean;
+    hasServerEnvKey: boolean;
+    maskedValue: string;
+    activeSource: AiKeySource;
+  };
+  environment: {
+    runtimeType: 'express_server' | 'cloudflare_worker';
+    encryptionKeyConfigured: boolean;
+    serviceAccountConfigured: boolean;
+    firestoreVaultSynced: boolean;
+    openrouterEnvConfigured: boolean;
+    groqEnvConfigured: boolean;
+    cloudflareSyncNote: string;
+  };
+  updatedAt?: string;
+  updatedByEmail?: string;
+}
+
+export interface AiAdminConfigUpdatePayload {
+  AI_PROVIDER: AiProviderType;
+  GEMINI_AI_MODEL: string;
+  GEMINI_FALLBACK_MODEL: string;
+  AI_RATE_LIMIT_PER_MIN: number;
+  AI_RATE_LIMIT_PER_DAY: number;
+  GEMINI_API_KEY?: string;
+  clearStoredApiKey?: boolean;
+}
+
+export interface AiConnectionTestResult {
+  success: boolean;
+  provider: string;
+  model: string;
+  latencyMs: number;
+  message: string;
+  replyPreview?: string;
+}

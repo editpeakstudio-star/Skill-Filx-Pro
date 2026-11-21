@@ -725,6 +725,42 @@ export async function authorizeAdmin(
   throw new HttpError(403, 'Forbidden: You do not have permission to perform this administrative action.');
 }
 
+export async function authorizeSuperAdmin(
+  authHeader: string | null,
+  env: WorkerEnv
+): Promise<VerifiedAdmin> {
+  const match = (authHeader || '').match(/^Bearer\s+(.+)$/i);
+  const idToken = match ? match[1].trim() : '';
+  const user = await verifyFirebaseIdToken(idToken, env);
+
+  if (user.email.toLowerCase() === PLATFORM_OWNER_EMAIL && user.emailVerified) {
+    return {
+      ...user,
+      role: 'owner',
+      permissions: ['telegram.manage', 'payments.verify', 'settings.manage', 'students.manage', 'master_admins.manage']
+    };
+  }
+
+  const fsToken = await getFirestoreAuthToken(env, idToken, false);
+  const profile = await getFirestoreDoc(env, fsToken, 'users', user.uid);
+  if (!profile) {
+    throw new HttpError(403, 'Forbidden: Super Admin profile not found.');
+  }
+  if (profile.isSuspended === true || profile.accountStatus === 'suspended') {
+    throw new HttpError(403, 'Forbidden: Your Super Admin account is currently suspended.');
+  }
+
+  const role = typeof profile.role === 'string' ? profile.role : 'user';
+  if (role === 'master_admin') {
+    const permissions = Array.isArray(profile.permissions)
+      ? profile.permissions.filter((p): p is string => typeof p === 'string')
+      : [];
+    return { ...user, role: 'master_admin', permissions };
+  }
+
+  throw new HttpError(403, 'Forbidden: AI Configuration & API Secrets are restricted strictly to the Owner and Super Admins.');
+}
+
 interface IdentityToolkitUser {
   localId?: string;
   email?: string;
