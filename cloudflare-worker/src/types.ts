@@ -8,6 +8,9 @@ export interface WorkerEnv {
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_CHAT_ID?: string;
   GEMINI_API_KEY?: string;
+  OPENROUTER_API_KEY?: string;
+  GROQ_API_KEY?: string;
+  AI_MODEL?: string;
   GEMINI_AI_MODEL?: string;
   GEMINI_FALLBACK_MODEL?: string;
   AI_PROVIDER?: string;
@@ -112,8 +115,12 @@ export interface TelegramNotificationLog {
 
 export class HttpError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  code?: string;
+  quota?: unknown;
+  constructor(status: number, message: string, code?: string, quota?: unknown) {
     super(message);
     this.status = status;
+    this.code = code;
+    this.quota = quota;
   }
 }

@@ -384,7 +384,9 @@ export const AiConfigManager: React.FC<AiConfigManagerProps> = ({ currentUser })
           <div className="flex-1 min-w-0 space-y-0.5">
             <div className="flex items-center justify-between gap-2 flex-wrap">
               <span className="font-bold text-white">
-                {testResult.success ? 'AI Connection Live' : 'AI Connection Check Failed'}
+                {testResult.success
+                  ? 'AI Connection Live'
+                  : `AI Connection Check Failed${testResult.statusCode ? ` (HTTP ${testResult.statusCode})` : ''}`}
               </span>
               <span className="text-[11px] font-mono text-zinc-300">
                 {testResult.model} • {testResult.latencyMs}ms
@@ -402,6 +404,20 @@ export const AiConfigManager: React.FC<AiConfigManagerProps> = ({ currentUser })
 
       {config && (
         <>
+          {config.apiKey.vaultDecryptError && (
+            <div className="p-3.5 rounded-2xl bg-amber-950/35 border border-amber-500/40 flex items-start gap-3 text-xs text-amber-200">
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <div className="space-y-1 flex-1">
+                <p className="font-bold text-white">Encrypted Vault Key Mismatch Detected</p>
+                <p className="leading-relaxed">
+                  An encrypted <code className="font-mono text-amber-300">GEMINI_API_KEY</code> exists in{' '}
+                  <code className="font-mono text-amber-300">aiConfig/active</code>, but this backend could not decrypt it.
+                  Make sure <code className="font-mono text-amber-300">TELEGRAM_ENCRYPTION_KEY</code> matches across Express and Cloudflare Worker, or click <strong>Edit Configuration</strong> and re-save your API key.
+                </p>
+              </div>
+            </div>
+          )}
+
           {/* Status Indicator Cards */}
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <div className="p-3.5 rounded-2xl bg-[#090D16] border border-blue-500/20 space-y-1">

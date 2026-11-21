@@ -61,6 +61,8 @@ async function aiAdminRequest<T>(
   const url = resolveUrl(path);
 
   let res: Response;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 25_000);
   try {
     res = await fetch(url, {
       method: options.method || 'GET',
@@ -69,10 +71,16 @@ async function aiAdminRequest<T>(
         Accept: 'application/json',
         ...(options.body !== undefined ? { 'Content-Type': 'application/json' } : {})
       },
-      body: options.body !== undefined ? JSON.stringify(options.body) : undefined
+      body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+      signal: controller.signal
     });
-  } catch {
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      throw new Error('AI Configuration API request timed out after 25s. Please try again.');
+    }
     throw new Error('Network error reaching AI Configuration API backend.');
+  } finally {
+    clearTimeout(timer);
   }
 
   const contentType = (res.headers.get('content-type') || '').toLowerCase();

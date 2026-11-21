@@ -177,15 +177,34 @@ export function getProjectId(env: WorkerEnv): string {
   return (env.FIREBASE_PROJECT_ID || DEFAULT_PROJECT_ID).trim();
 }
 
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = 8000
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      throw new HttpError(504, 'Firebase backend request timed out.', 'FIREBASE_TIMEOUT');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fetchGoogleJwks(forceRefresh = false): Promise<Array<JsonWebKey & { kid?: string }>> {
   const now = Date.now();
   if (!forceRefresh && jwkCache && jwkCache.expiresAt > now) {
     return jwkCache.keys;
   }
 
-  const res = await fetch(GOOGLE_JWK_URL, { headers: { Accept: 'application/json' } });
+  const res = await fetchWithTimeout(GOOGLE_JWK_URL, { headers: { Accept: 'application/json' } }, 8000);
   if (!res.ok) {
-    throw new HttpError(502, `Failed to fetch Firebase signing keys (${res.status}).`);
+    throw new HttpError(502, `Failed to fetch Firebase signing keys (${res.status}).`, 'AUTH_JWKS_ERROR');
   }
 
   const json = (await res.json()) as { keys?: Array<JsonWebKey & { kid?: string }> };
@@ -379,14 +398,18 @@ export async function getServiceAccountAccessToken(
   );
   const assertion = `${signingInput}.${uint8ArrayToBase64Url(new Uint8Array(sigBuf))}`;
 
-  const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-      assertion
-    }).toString()
-  });
+  const tokenRes = await fetchWithTimeout(
+    'https://oauth2.googleapis.com/token',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+        assertion
+      }).toString()
+    },
+    8000
+  );
 
   const tokenJson = (await tokenRes.json().catch(() => ({}))) as {
     access_token?: string;
@@ -531,9 +554,11 @@ export async function getFirestoreDoc(
   collection: string,
   docId: string
 ): Promise<Record<string, unknown> | null> {
-  const res = await fetch(baseDocPath(getProjectId(env), collection, docId), {
-    headers: { Authorization: `Bearer ${authToken}`, Accept: 'application/json' }
-  });
+  const res = await fetchWithTimeout(
+    baseDocPath(getProjectId(env), collection, docId),
+    { headers: { Authorization: `Bearer ${authToken}`, Accept: 'application/json' } },
+    8000
+  );
   if (res.status === 404) return null;
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -557,9 +582,11 @@ export async function listFirestoreCollection(
     url.searchParams.set('pageSize', '200');
     if (pageToken) url.searchParams.set('pageToken', pageToken);
 
-    const res = await fetch(url.toString(), {
-      headers: { Authorization: `Bearer ${authToken}`, Accept: 'application/json' }
-    });
+    const res = await fetchWithTimeout(
+      url.toString(),
+      { headers: { Authorization: `Bearer ${authToken}`, Accept: 'application/json' } },
+      8000
+    );
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       throw new HttpError(res.status === 403 ? 403 : 502, `Firestore list failed (${res.status}): ${text.slice(0, 180)}`);
@@ -618,14 +645,18 @@ export async function upsertFirestoreDoc(
   docId: string,
   data: Record<string, unknown>
 ): Promise<void> {
-  const res = await fetch(baseDocPath(getProjectId(env), collection, docId), {
-    method: 'PATCH',
-    headers: {
-      Authorization: `Bearer ${authToken}`,
-      'Content-Type': 'application/json'
+  const res = await fetchWithTimeout(
+    baseDocPath(getProjectId(env), collection, docId),
+    {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${authToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ fields: encodeFields(data) })
     },
-    body: JSON.stringify({ fields: encodeFields(data) })
-  });
+    8000
+  );
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     throw new HttpError(res.status === 403 ? 403 : 502, `Firestore upsert failed (${res.status}): ${text.slice(0, 180)}`);

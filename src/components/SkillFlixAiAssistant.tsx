@@ -132,11 +132,35 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
 
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const activeControllerRef = useRef<AbortController | null>(null);
+  const requestSeqRef = useRef(0);
+  const inFlightRef = useRef(false);
+
+  const abortActiveRequest = () => {
+    requestSeqRef.current += 1;
+    inFlightRef.current = false;
+    if (activeControllerRef.current) {
+      activeControllerRef.current.abort();
+      activeControllerRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      abortActiveRequest();
+    };
+  }, []);
+
+  useEffect(() => {
+    abortActiveRequest();
+    setIsSending(false);
+  }, [currentUser?.uid]);
 
   useEffect(() => {
     if (!isOpen) return;
     let active = true;
-    fetchSkillFlixAiStatus()
+    const statusController = new AbortController();
+    fetchSkillFlixAiStatus(statusController.signal)
       .then(info => {
         if (active) setStatusInfo(info);
       })
@@ -155,6 +179,7 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
       });
     return () => {
       active = false;
+      statusController.abort();
     };
   }, [isOpen]);
 
@@ -177,6 +202,8 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
   };
 
   const handleClearChat = () => {
+    abortActiveRequest();
+    setIsSending(false);
     setMessages([createWelcomeMessage()]);
     setErrorBanner(null);
     setLastFailedPrompt(null);
@@ -184,7 +211,7 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
 
   const submitPrompt = async (rawPrompt: string) => {
     const cleanPrompt = rawPrompt.trim();
-    if (!cleanPrompt || isSending) return;
+    if (!cleanPrompt || isSending || inFlightRef.current) return;
 
     if (!currentUser?.uid) {
       setErrorBanner({
@@ -209,6 +236,11 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
       .slice(-10)
       .map(m => ({ role: m.role, text: m.text }));
 
+    const seq = ++requestSeqRef.current;
+    const controller = new AbortController();
+    activeControllerRef.current = controller;
+    inFlightRef.current = true;
+
     setMessages(prev => [...prev, userMsg]);
     setInput('');
     setIsSending(true);
@@ -216,8 +248,11 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
     try {
       const response = await sendSkillFlixAiMessage({
         message: cleanPrompt,
-        history: historyForServer
+        history: historyForServer,
+        signal: controller.signal
       });
+
+      if (requestSeqRef.current !== seq) return;
 
       const assistantMsg: AiChatMessage = {
         id: `a_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -231,6 +266,11 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
       setMessages(prev => [...prev, assistantMsg]);
       setQuota(response.quota);
     } catch (err: any) {
+      if (requestSeqRef.current !== seq) return;
+      if (err instanceof AiClientError && err.code === 'AI_CANCELLED') {
+        return;
+      }
+
       const code = err instanceof AiClientError ? err.code : 'AI_REQUEST_FAILED';
       const msg =
         err instanceof Error && err.message
@@ -240,7 +280,11 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
       setErrorBanner({ code, message: msg });
       setLastFailedPrompt(cleanPrompt);
     } finally {
-      setIsSending(false);
+      if (requestSeqRef.current === seq) {
+        activeControllerRef.current = null;
+        inFlightRef.current = false;
+        setIsSending(false);
+      }
     }
   };
 
@@ -325,9 +369,8 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
               <button
                 type="button"
                 onClick={handleClearChat}
-                disabled={isSending}
-                className="p-1.5 rounded-xl text-slate-400 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer disabled:opacity-40"
-                title="Clear chat"
+                className="p-1.5 rounded-xl text-slate-400 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer"
+                title={isSending ? 'Cancel & clear chat' : 'Clear chat'}
                 aria-label="Clear chat"
               >
                 <Trash2 className="w-4 h-4" />

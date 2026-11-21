@@ -396,6 +396,7 @@ export interface AiAdminConfigView {
     isConfigured: boolean;
     hasStoredVaultKey: boolean;
     hasServerEnvKey: boolean;
+    vaultDecryptError?: boolean;
     maskedValue: string;
     activeSource: AiKeySource;
   };
@@ -429,4 +430,6 @@ export interface AiConnectionTestResult {
   latencyMs: number;
   message: string;
   replyPreview?: string;
+  statusCode?: number;
+  errorCode?: string;
 }

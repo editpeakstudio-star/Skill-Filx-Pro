@@ -661,7 +661,7 @@ async function handleRequest(request: Request, env: WorkerEnv): Promise<Response
     return jsonResponse(request, env, result);
   }
 
-  throw new HttpError(404, `Endpoint not found: ${method} ${pathname}`);
+  throw new HttpError(404, `Endpoint not found: ${method} ${pathname}`, 'ENDPOINT_NOT_FOUND');
 }
 
 export default {
@@ -671,7 +671,14 @@ export default {
     } catch (err) {
       const status = err instanceof HttpError ? err.status : 500;
       const message = sanitizeError((err as Error)?.message || 'Internal server error.');
-      return jsonResponse(request, env, { error: message }, status);
+      const payload: Record<string, unknown> = {
+        error: message,
+        code: err instanceof HttpError && err.code ? err.code : status === 500 ? 'INTERNAL_ERROR' : 'REQUEST_ERROR'
+      };
+      if (err instanceof HttpError && err.quota !== undefined) {
+        payload.quota = err.quota;
+      }
+      return jsonResponse(request, env, payload, status);
     }
   }
 };

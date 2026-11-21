@@ -19,9 +19,12 @@ export interface WorkerResolvedAiConfig {
   AI_RATE_LIMIT_PER_MIN: number;
   AI_RATE_LIMIT_PER_DAY: number;
   GEMINI_API_KEY: string;
+  OPENROUTER_API_KEY: string;
+  GROQ_API_KEY: string;
   keySource: 'env_secret' | 'encrypted_vault' | 'none';
   hasStoredVaultKey: boolean;
   hasServerEnvKey: boolean;
+  vaultDecryptError: boolean;
   maskedValue: string;
   firestoreVaultSynced: boolean;
   updatedAt?: string;
@@ -43,9 +46,13 @@ function maskKey(raw: string): string {
   return `${clean.slice(0, 4)}••••••••${clean.slice(-4)}`;
 }
 
-async function fetchVaultDoc(env: WorkerEnv, callerToken?: string): Promise<{ doc: Record<string, unknown> | null; synced: boolean }> {
+async function fetchVaultDoc(
+  env: WorkerEnv,
+  callerToken?: string,
+  bypassCache = false
+): Promise<{ doc: Record<string, unknown> | null; synced: boolean }> {
   const now = Date.now();
-  if (!callerToken && vaultCache && vaultCache.expiresAt > now) {
+  if (!callerToken && !bypassCache && vaultCache && vaultCache.expiresAt > now && vaultCache.synced && vaultCache.doc) {
     return { doc: vaultCache.doc, synced: vaultCache.synced };
   }
 
@@ -58,15 +65,19 @@ async function fetchVaultDoc(env: WorkerEnv, callerToken?: string): Promise<{ do
       return { doc: null, synced: false };
     }
     const doc = await getFirestoreDoc(env, fsToken, AI_CONFIG_COLLECTION, AI_CONFIG_DOC_ID);
-    vaultCache = { expiresAt: now + 30_000, doc, synced: true };
+    vaultCache = { expiresAt: now + 10_000, doc, synced: true };
     return { doc, synced: true };
   } catch {
     return { doc: vaultCache?.doc || null, synced: false };
   }
 }
 
-export async function resolveWorkerAiConfig(env: WorkerEnv, callerToken?: string): Promise<WorkerResolvedAiConfig> {
-  const { doc, synced } = await fetchVaultDoc(env, callerToken);
+export async function resolveWorkerAiConfig(
+  env: WorkerEnv,
+  callerToken?: string,
+  bypassCache = false
+): Promise<WorkerResolvedAiConfig> {
+  const { doc, synced } = await fetchVaultDoc(env, callerToken, bypassCache);
 
   const envProvider = (env.AI_PROVIDER || 'gemini').trim().toLowerCase();
   const docProvider = typeof doc?.aiProvider === 'string' ? doc.aiProvider.trim().toLowerCase() : '';
@@ -95,15 +106,21 @@ export async function resolveWorkerAiConfig(env: WorkerEnv, callerToken?: string
   const perDay = Math.max(1, Math.min(5000, Math.round(perDayRaw || 60)));
 
   let vaultKey = '';
+  let vaultDecryptError = false;
   const encryptedPayload =
     typeof doc?.encryptedGeminiApiKey === 'string' && doc.encryptedGeminiApiKey.startsWith('v1:')
       ? doc.encryptedGeminiApiKey
       : '';
-  if (encryptedPayload && env.TELEGRAM_ENCRYPTION_KEY?.trim()) {
-    try {
-      vaultKey = (await decryptBotToken(encryptedPayload, env.TELEGRAM_ENCRYPTION_KEY)).trim();
-    } catch {
-      vaultKey = '';
+  if (encryptedPayload) {
+    if (env.TELEGRAM_ENCRYPTION_KEY?.trim()) {
+      try {
+        vaultKey = (await decryptBotToken(encryptedPayload, env.TELEGRAM_ENCRYPTION_KEY)).trim();
+      } catch {
+        vaultKey = '';
+        vaultDecryptError = true;
+      }
+    } else {
+      vaultDecryptError = true;
     }
   }
 
@@ -125,9 +142,12 @@ export async function resolveWorkerAiConfig(env: WorkerEnv, callerToken?: string
     AI_RATE_LIMIT_PER_MIN: perMin,
     AI_RATE_LIMIT_PER_DAY: perDay,
     GEMINI_API_KEY: effectiveKey,
+    OPENROUTER_API_KEY: (env.OPENROUTER_API_KEY || '').trim(),
+    GROQ_API_KEY: (env.GROQ_API_KEY || '').trim(),
     keySource,
     hasStoredVaultKey,
     hasServerEnvKey,
+    vaultDecryptError,
     maskedValue,
     firestoreVaultSynced: synced,
     updatedAt: typeof doc?.updatedAt === 'string' ? doc.updatedAt : undefined,
@@ -150,6 +170,7 @@ export async function getWorkerAdminAiConfigView(env: WorkerEnv, admin: Verified
       isConfigured: Boolean(resolved.GEMINI_API_KEY),
       hasStoredVaultKey: resolved.hasStoredVaultKey,
       hasServerEnvKey: resolved.hasServerEnvKey,
+      vaultDecryptError: resolved.vaultDecryptError,
       maskedValue: resolved.maskedValue,
       activeSource: resolved.keySource
     },
@@ -158,8 +179,8 @@ export async function getWorkerAdminAiConfigView(env: WorkerEnv, admin: Verified
       encryptionKeyConfigured: Boolean(env.TELEGRAM_ENCRYPTION_KEY?.trim()),
       serviceAccountConfigured: hasServiceAccountConfig(env),
       firestoreVaultSynced: resolved.firestoreVaultSynced,
-      openrouterEnvConfigured: false,
-      groqEnvConfigured: false,
+      openrouterEnvConfigured: Boolean(resolved.OPENROUTER_API_KEY),
+      groqEnvConfigured: Boolean(resolved.GROQ_API_KEY),
       cloudflareSyncNote:
         'Settings saved here update the encrypted Firestore vault (aiConfig/active). Cloudflare Worker secrets created via Wrangler CLI can only be updated directly via Wrangler CLI or Cloudflare Dashboard.'
     },
@@ -175,32 +196,36 @@ export async function saveWorkerAdminAiConfig(
 ) {
   const rawProvider = typeof body.AI_PROVIDER === 'string' ? body.AI_PROVIDER.trim().toLowerCase() : '';
   if (!ALLOWED_PROVIDERS.has(rawProvider)) {
-    throw new HttpError(400, 'AI_PROVIDER must be one of: gemini, openrouter, groq.');
+    throw new HttpError(400, 'AI_PROVIDER must be one of: gemini, openrouter, groq.', 'INVALID_AI_PROVIDER');
   }
 
   const primaryModel = typeof body.GEMINI_AI_MODEL === 'string' ? body.GEMINI_AI_MODEL.trim() : '';
   if (!primaryModel || primaryModel.length > 120 || !/^[A-Za-z0-9._:/-]+$/.test(primaryModel)) {
-    throw new HttpError(400, 'GEMINI_AI_MODEL must be a valid model identifier.');
+    throw new HttpError(400, 'GEMINI_AI_MODEL must be a valid model identifier.', 'INVALID_AI_MODEL');
   }
 
   const fallbackModel = typeof body.GEMINI_FALLBACK_MODEL === 'string' ? body.GEMINI_FALLBACK_MODEL.trim() : '';
   if (!fallbackModel || fallbackModel.length > 120 || !/^[A-Za-z0-9._:/-]+$/.test(fallbackModel)) {
-    throw new HttpError(400, 'GEMINI_FALLBACK_MODEL must be a valid model identifier.');
+    throw new HttpError(400, 'GEMINI_FALLBACK_MODEL must be a valid model identifier.', 'INVALID_FALLBACK_MODEL');
   }
 
   const perMin = Number(body.AI_RATE_LIMIT_PER_MIN);
   if (!Number.isInteger(perMin) || perMin < 1 || perMin > 120) {
-    throw new HttpError(400, 'AI_RATE_LIMIT_PER_MIN must be a whole number between 1 and 120.');
+    throw new HttpError(400, 'AI_RATE_LIMIT_PER_MIN must be a whole number between 1 and 120.', 'INVALID_RATE_LIMIT');
   }
 
   const perDay = Number(body.AI_RATE_LIMIT_PER_DAY);
   if (!Number.isInteger(perDay) || perDay < 1 || perDay > 5000 || perDay < perMin) {
-    throw new HttpError(400, 'AI_RATE_LIMIT_PER_DAY must be a whole number between AI_RATE_LIMIT_PER_MIN and 5000.');
+    throw new HttpError(
+      400,
+      'AI_RATE_LIMIT_PER_DAY must be a whole number between AI_RATE_LIMIT_PER_MIN and 5000.',
+      'INVALID_RATE_LIMIT'
+    );
   }
 
   const newKey = typeof body.GEMINI_API_KEY === 'string' ? body.GEMINI_API_KEY.trim() : '';
   if (newKey && (newKey.length < 16 || newKey.length > 256 || /\s/.test(newKey))) {
-    throw new HttpError(400, 'GEMINI_API_KEY format looks invalid.');
+    throw new HttpError(400, 'GEMINI_API_KEY format looks invalid.', 'INVALID_API_KEY_FORMAT');
   }
 
   const fsToken = await getFirestoreAuthToken(env, admin.idToken, false);
@@ -224,7 +249,7 @@ export async function saveWorkerAdminAiConfig(
       encryptedGeminiApiKey = await encryptBotToken(newKey, env.TELEGRAM_ENCRYPTION_KEY);
       maskedGeminiApiKey = maskKey(newKey);
     } catch (err) {
-      throw new HttpError(500, sanitizeError((err as Error).message, [newKey]));
+      throw new HttpError(500, sanitizeError((err as Error).message, [newKey]), 'VAULT_ENCRYPT_FAILED');
     }
   }
 

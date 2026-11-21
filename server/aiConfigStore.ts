@@ -26,6 +26,7 @@ export interface ResolvedAiRuntimeConfig extends AiAdminConfigSettings {
   keySource: AiKeySource;
   hasStoredVaultKey: boolean;
   hasServerEnvKey: boolean;
+  vaultDecryptError: boolean;
   maskedGeminiApiKey: string;
   firestoreVaultSynced: boolean;
   updatedAt?: string;
@@ -185,11 +186,13 @@ export function getResolvedRuntimeAiConfig(): ResolvedAiRuntimeConfig {
   const override = memoryOverride;
 
   let vaultKey = '';
+  let vaultDecryptError = false;
   if (override?.encryptedGeminiApiKey) {
     try {
       vaultKey = decryptBotToken(override.encryptedGeminiApiKey).trim();
     } catch {
       vaultKey = '';
+      vaultDecryptError = true;
     }
   }
 
@@ -217,6 +220,7 @@ export function getResolvedRuntimeAiConfig(): ResolvedAiRuntimeConfig {
     keySource,
     hasStoredVaultKey,
     hasServerEnvKey,
+    vaultDecryptError,
     maskedGeminiApiKey,
     firestoreVaultSynced: firestoreSynced,
     updatedAt: override?.updatedAt,
@@ -240,6 +244,7 @@ export async function getAdminAiConfigView(adminToken: string): Promise<AiAdminC
       isConfigured: Boolean(resolved.GEMINI_API_KEY),
       hasStoredVaultKey: resolved.hasStoredVaultKey,
       hasServerEnvKey: resolved.hasServerEnvKey,
+      vaultDecryptError: resolved.vaultDecryptError,
       maskedValue: resolved.maskedGeminiApiKey,
       activeSource: resolved.keySource
     },

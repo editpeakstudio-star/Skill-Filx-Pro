@@ -9,6 +9,7 @@ import {
   getResolvedRuntimeAiConfig,
   hydrateAiConfigFromFirestore
 } from './aiConfigStore.ts';
+import { sanitizeErrorMessage } from './telegramCrypto.ts';
 
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'skillflix-academy';
 const PLATFORM_OWNER_EMAIL = 'editpeakstudio@gmail.com';
@@ -182,7 +183,11 @@ export function getAiStatus(): AiPublicStatus {
       model: cfg.GEMINI_AI_MODEL,
       fallbackModel: cfg.GEMINI_FALLBACK_MODEL,
       freeTier: true,
-      reason: hasGeminiKey ? undefined : 'Gemini API key is not configured.',
+      reason: hasGeminiKey
+        ? undefined
+        : cfg.vaultDecryptError
+          ? 'Encrypted GEMINI_API_KEY exists in vault, but TELEGRAM_ENCRYPTION_KEY failed to decrypt it.'
+          : 'Gemini API key is not configured.',
       limits: {
         perMinute: cfg.AI_RATE_LIMIT_PER_MIN,
         perDay: cfg.AI_RATE_LIMIT_PER_DAY
@@ -190,14 +195,16 @@ export function getAiStatus(): AiPublicStatus {
     };
   }
 
-  const online = hasAltKey || hasGeminiKey;
   return {
-    online,
+    online: hasAltKey,
     provider: cfg.AI_PROVIDER,
-    model: process.env.AI_MODEL || cfg.GEMINI_AI_MODEL,
+    model:
+      (!cfg.GEMINI_AI_MODEL.toLowerCase().startsWith('gemini-') ? cfg.GEMINI_AI_MODEL : '') ||
+      process.env.AI_MODEL ||
+      (cfg.AI_PROVIDER === 'groq' ? 'llama-3.3-70b-versatile' : 'meta-llama/llama-3.3-70b-instruct:free'),
     fallbackModel: cfg.GEMINI_FALLBACK_MODEL,
     freeTier: true,
-    reason: online ? undefined : 'AI provider API key is not configured.',
+    reason: hasAltKey ? undefined : `${cfg.AI_PROVIDER.toUpperCase()} API key is not configured in server environment.`,
     limits: {
       perMinute: cfg.AI_RATE_LIMIT_PER_MIN,
       perDay: cfg.AI_RATE_LIMIT_PER_DAY
@@ -252,20 +259,49 @@ function decodeFsDoc(docJson: { name?: string; fields?: Record<string, RawFsVal>
   return out;
 }
 
+async function fetchAiWithTimeout(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = 25_000,
+  knownSecrets: string[] = []
+): Promise<globalThis.Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      throw new AiServiceError(
+        504,
+        'AI_TIMEOUT',
+        'Skill-Flix AI request timed out while waiting for the server. Please try again.'
+      );
+    }
+    const cleanMsg = sanitizeErrorMessage(err?.message || 'Upstream network request failed.', knownSecrets);
+    throw new AiServiceError(503, 'AI_NETWORK_ERROR', cleanMsg);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function runFirestoreQuery(
   structuredQuery: Record<string, unknown>,
   idToken: string
 ): Promise<Record<string, unknown>[]> {
   const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:runQuery`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${idToken}`,
-      'Content-Type': 'application/json',
-      Accept: 'application/json'
+  const res = await fetchAiWithTimeout(
+    url,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${idToken}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json'
+      },
+      body: JSON.stringify({ structuredQuery })
     },
-    body: JSON.stringify({ structuredQuery })
-  });
+    8000
+  );
 
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
@@ -631,10 +667,36 @@ LIVE SKILL-FLIX CATALOG & ACCESSIBLE RESOURCES:
 ${catalogSummary}`;
 }
 
-function classifyUpstreamGeminiError(err: any, quota: AiQuotaSnapshot): AiServiceError {
+function classifyUpstreamGeminiError(
+  err: any,
+  quota: AiQuotaSnapshot,
+  knownSecrets: string[] = []
+): AiServiceError {
+  if (err instanceof AiServiceError) {
+    return err;
+  }
+
   const status = Number(err?.status || err?.code || 0);
-  const rawMessage = String(err?.message || '');
+  const rawMessage = sanitizeErrorMessage(String(err?.message || ''), knownSecrets);
   const upper = rawMessage.toUpperCase();
+
+  if (
+    err?.name === 'AbortError' ||
+    err?.name === 'TimeoutError' ||
+    status === 408 ||
+    status === 504 ||
+    upper.includes('TIMEOUT') ||
+    upper.includes('TIMED OUT') ||
+    upper.includes('DEADLINE_EXCEEDED') ||
+    upper.includes('ABORTED')
+  ) {
+    return new AiServiceError(
+      504,
+      'AI_TIMEOUT',
+      'Skill-Flix AI took too long to respond from Gemini. Please try again in a moment.',
+      quota
+    );
+  }
 
   if (status === 429 || upper.includes('RESOURCE_EXHAUSTED') || upper.includes('QUOTA')) {
     return new AiServiceError(
@@ -645,27 +707,51 @@ function classifyUpstreamGeminiError(err: any, quota: AiQuotaSnapshot): AiServic
     );
   }
 
-  if (status === 400 && upper.includes('API_KEY_INVALID')) {
+  if (status === 404 || upper.includes('NOT_FOUND') || upper.includes('MODEL_NOT_FOUND')) {
     return new AiServiceError(
-      503,
-      'AI_CONFIG_ERROR',
-      'Gemini API key configuration needs attention in server Secrets.'
+      404,
+      'AI_MODEL_UNAVAILABLE',
+      'Configured Gemini AI model was not found or is unavailable. Check GEMINI_AI_MODEL and GEMINI_FALLBACK_MODEL in AI Configuration.'
+    );
+  }
+
+  if (status === 400 && (upper.includes('API_KEY') || upper.includes('KEY_INVALID'))) {
+    return new AiServiceError(
+      400,
+      'AI_INVALID_API_KEY',
+      'Configured GEMINI_API_KEY was rejected as invalid by Google Gemini API. Verify the key in AI Configuration.'
+    );
+  }
+
+  if (status === 400) {
+    return new AiServiceError(
+      400,
+      'AI_BAD_REQUEST',
+      'Gemini API rejected the request parameters. Check your model configuration and prompt.'
+    );
+  }
+
+  if (status === 401 || upper.includes('UNAUTHENTICATED')) {
+    return new AiServiceError(
+      401,
+      'AI_PROVIDER_AUTH_FAILED',
+      'Gemini API authentication failed (401). Verify your GEMINI_API_KEY.'
     );
   }
 
   if (status === 403 || upper.includes('PERMISSION_DENIED')) {
     return new AiServiceError(
-      503,
+      403,
       'AI_PERMISSION_DENIED',
-      'Gemini API access was denied by the provider. Check the configured API key in server Secrets.'
+      'Gemini API access was denied (403). Verify GEMINI_API_KEY permissions and API activation.'
     );
   }
 
-  if (status === 404 || upper.includes('NOT_FOUND')) {
+  if (status === 503 || upper.includes('UNAVAILABLE')) {
     return new AiServiceError(
       503,
-      'AI_MODEL_UNAVAILABLE',
-      'Configured AI model was unavailable on the provider.'
+      'AI_PROVIDER_UNAVAILABLE',
+      'Gemini AI service is temporarily unavailable. Please try again in a moment.'
     );
   }
 
@@ -688,6 +774,7 @@ async function generateWithGeminiSdk(
   const ai = new GoogleGenAI({
     apiKey,
     httpOptions: {
+      timeout: 24_000,
       headers: {
         'User-Agent': 'aistudio-build'
       }
@@ -709,14 +796,18 @@ async function generateWithGeminiSdk(
   let lastError: any = null;
 
   for (const modelName of modelsToTry) {
+    const supportsThinkingLevel = /^gemini-(?:3|4)/i.test(modelName);
     for (let attempt = 0; attempt < 2; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 25_000);
       try {
         const response = await ai.models.generateContent({
           model: modelName,
           contents,
           config: {
             systemInstruction,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW }
+            abortSignal: controller.signal,
+            ...(supportsThinkingLevel ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } } : {})
           }
         });
         const text = (response.text || '').trim();
@@ -728,93 +819,151 @@ async function generateWithGeminiSdk(
         lastError = err;
         const msgUpper = String(err?.message || '').toUpperCase();
         const status = Number(err?.status || err?.code || 0);
-        const isQuotaOrRate = status === 429 || msgUpper.includes('RESOURCE_EXHAUSTED') || msgUpper.includes('QUOTA');
-        const isTransient = status === 500 || status === 503 || msgUpper.includes('UNAVAILABLE') || msgUpper.includes('TIMEOUT');
+        const isAuthOrKeyInvalid =
+          status === 401 ||
+          status === 403 ||
+          (status === 400 && (msgUpper.includes('API_KEY') || msgUpper.includes('KEY_INVALID')));
+        const isQuotaOrModelMissing =
+          status === 429 ||
+          status === 404 ||
+          msgUpper.includes('RESOURCE_EXHAUSTED') ||
+          msgUpper.includes('QUOTA') ||
+          msgUpper.includes('NOT_FOUND');
+        const isTransient =
+          err?.name === 'AbortError' ||
+          status === 408 ||
+          status === 500 ||
+          status === 502 ||
+          status === 503 ||
+          status === 504 ||
+          msgUpper.includes('UNAVAILABLE') ||
+          msgUpper.includes('TIMEOUT');
 
-        if (isQuotaOrRate) {
-          // Immediately try fallback free-tier model if one exists
+        if (isAuthOrKeyInvalid) {
+          throw classifyUpstreamGeminiError(err, quota, [apiKey]);
+        }
+        if (isQuotaOrModelMissing) {
+          // Immediately try fallback model if configured
           break;
         }
         if (isTransient && attempt === 0) {
-          await new Promise(resolve => setTimeout(resolve, 400));
+          await new Promise(resolve => setTimeout(resolve, 350));
           continue;
         }
-        if (status === 400 || status === 403) {
-          throw classifyUpstreamGeminiError(err, quota);
-        }
+        // Exhausted retries on primary -> try fallback model
         break;
+      } finally {
+        clearTimeout(timer);
       }
     }
   }
 
-  throw classifyUpstreamGeminiError(lastError, quota);
+  throw classifyUpstreamGeminiError(lastError, quota, [apiKey]);
 }
 
 async function generateWithOpenAiCompatibleProvider(
-  provider: string,
+  provider: 'openrouter' | 'groq',
+  apiKey: string,
+  primaryModel: string,
+  fallbackModel: string,
   systemInstruction: string,
   history: AiTurnInput[],
-  userMessage: string
+  userMessage: string,
+  quota: AiQuotaSnapshot
 ): Promise<{ text: string; model: string }> {
   const endpoint =
     provider === 'groq'
       ? 'https://api.groq.com/openai/v1/chat/completions'
       : 'https://openrouter.ai/api/v1/chat/completions';
-  const apiKey = (
-    provider === 'groq' ? process.env.GROQ_API_KEY : process.env.OPENROUTER_API_KEY
-  )?.trim();
 
   if (!apiKey) {
     throw new AiServiceError(
       503,
-      'AI_CONFIG_ERROR',
+      'AI_KEY_NOT_CONFIGURED',
       `API key for configurable provider "${provider}" is not configured in server environment.`
     );
   }
 
-  const model = (
-    process.env.AI_MODEL ||
-    (provider === 'groq' ? 'llama-3.3-70b-versatile' : 'meta-llama/llama-3.3-70b-instruct:free')
-  ).trim();
+  const defaultProviderModel =
+    provider === 'groq' ? 'llama-3.3-70b-versatile' : 'meta-llama/llama-3.3-70b-instruct:free';
+  const configuredPrimary =
+    (!primaryModel.toLowerCase().startsWith('gemini-') ? primaryModel : '') ||
+    process.env.AI_MODEL?.trim() ||
+    defaultProviderModel;
+  const configuredFallback =
+    fallbackModel && !fallbackModel.toLowerCase().startsWith('gemini-') ? fallbackModel : '';
+  const modelsToTry = Array.from(new Set([configuredPrimary, configuredFallback].filter(Boolean)));
 
-  const res = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: 'system', content: systemInstruction },
-        ...history.map(h => ({
-          role: h.role === 'model' ? 'assistant' : 'user',
-          content: h.text
-        })),
-        { role: 'user', content: userMessage }
-      ]
-    })
-  });
+  let lastStatus = 502;
+  let lastBody = '';
 
-  if (!res.ok) {
-    if (res.status === 429) {
-      throw new AiServiceError(
-        429,
-        'UPSTREAM_QUOTA_EXHAUSTED',
-        'AI free-tier rate limit reached. Please wait a minute and try again.'
-      );
+  for (const model of modelsToTry) {
+    const res = await fetchAiWithTimeout(
+      endpoint,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'system', content: systemInstruction },
+            ...history.map(h => ({
+              role: h.role === 'model' ? 'assistant' : 'user',
+              content: h.text
+            })),
+            { role: 'user', content: userMessage }
+          ]
+        })
+      },
+      25_000,
+      [apiKey]
+    );
+
+    if (res.ok) {
+      const json = (await res.json().catch(() => ({}))) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      const text = (json.choices?.[0]?.message?.content || '').trim();
+      if (text) return { text, model };
+      lastStatus = 502;
+      continue;
     }
-    throw new AiServiceError(502, 'AI_UPSTREAM_ERROR', `Upstream AI request failed (${res.status}).`);
+
+    lastStatus = res.status;
+    lastBody = sanitizeErrorMessage(await res.text().catch(() => ''), [apiKey]);
+    if (res.status === 401 || res.status === 403 || res.status === 400) {
+      break;
+    }
   }
 
-  const json = (await res.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
-  };
-  const text = (json.choices?.[0]?.message?.content || '').trim();
-  if (!text) {
-    throw new AiServiceError(502, 'AI_EMPTY_RESPONSE', 'AI returned an empty response. Please try again.');
+  if (lastStatus === 429) {
+    throw new AiServiceError(
+      429,
+      'UPSTREAM_QUOTA_EXHAUSTED',
+      'AI free-tier rate limit reached. Please wait a minute and try again.',
+      quota
+    );
   }
-  return { text, model };
+  if (lastStatus === 401) {
+    throw new AiServiceError(401, 'AI_PROVIDER_AUTH_FAILED', `${provider} rejected the API key (401).`);
+  }
+  if (lastStatus === 403) {
+    throw new AiServiceError(403, 'AI_PERMISSION_DENIED', `${provider} access was denied (403).`);
+  }
+  if (lastStatus === 404) {
+    throw new AiServiceError(404, 'AI_MODEL_UNAVAILABLE', `${provider} model was not found (404).`);
+  }
+  if (lastStatus === 400) {
+    throw new AiServiceError(400, 'AI_BAD_REQUEST', `${provider} rejected the request (400).`);
+  }
+  throw new AiServiceError(
+    lastStatus === 503 ? 503 : 502,
+    lastStatus === 503 ? 'AI_PROVIDER_UNAVAILABLE' : 'AI_UPSTREAM_ERROR',
+    `Upstream ${provider} AI request failed (${lastStatus})${lastBody ? `: ${lastBody.slice(0, 120)}` : '.'}`
+  );
 }
 
 export async function handleSkillFlixAiChat(
@@ -858,14 +1007,25 @@ export async function handleSkillFlixAiChat(
       : cfg.AI_PROVIDER === 'openrouter'
         ? cfg.OPENROUTER_API_KEY
         : '';
-  const useGemini = cfg.AI_PROVIDER === 'gemini' || !altProviderKey;
+  const useGemini = cfg.AI_PROVIDER === 'gemini';
   const geminiKey = cfg.GEMINI_API_KEY;
 
   if (useGemini && !geminiKey) {
     throw new AiServiceError(
       503,
+      cfg.vaultDecryptError ? 'AI_VAULT_DECRYPT_FAILED' : 'AI_KEY_NOT_CONFIGURED',
+      cfg.vaultDecryptError
+        ? 'An encrypted GEMINI_API_KEY exists in Firestore vault, but could not be decrypted. Ensure TELEGRAM_ENCRYPTION_KEY matches or re-save the key in Admin Panel.'
+        : 'Skill-Flix AI is waiting for GEMINI_API_KEY to be configured by the Platform Owner.',
+      getOrUpdateQuota(caller.uid, false, cfg.AI_RATE_LIMIT_PER_MIN, cfg.AI_RATE_LIMIT_PER_DAY)
+    );
+  }
+
+  if (!useGemini && !altProviderKey) {
+    throw new AiServiceError(
+      503,
       'AI_KEY_NOT_CONFIGURED',
-      'Skill-Flix AI is waiting for GEMINI_API_KEY to be configured by the Platform Owner.',
+      `API key for selected provider "${cfg.AI_PROVIDER}" is not configured in server secrets.`,
       getOrUpdateQuota(caller.uid, false, cfg.AI_RATE_LIMIT_PER_MIN, cfg.AI_RATE_LIMIT_PER_DAY)
     );
   }
@@ -893,10 +1053,14 @@ export async function handleSkillFlixAiChat(
     providerLabel = 'Google Gemini API (Free Tier)';
   } else {
     result = await generateWithOpenAiCompatibleProvider(
-      cfg.AI_PROVIDER,
+      cfg.AI_PROVIDER as 'openrouter' | 'groq',
+      altProviderKey,
+      cfg.GEMINI_AI_MODEL,
+      cfg.GEMINI_FALLBACK_MODEL,
       systemInstruction,
       cleanHistory,
-      cleanMessage
+      cleanMessage,
+      quota
     );
     providerLabel = cfg.AI_PROVIDER;
   }
@@ -927,7 +1091,8 @@ export async function testAiConfigurationConnection(adminToken: string): Promise
       : cfg.AI_PROVIDER === 'openrouter'
         ? cfg.OPENROUTER_API_KEY
         : '';
-  const useGemini = cfg.AI_PROVIDER === 'gemini' || !altProviderKey;
+  const useGemini = cfg.AI_PROVIDER === 'gemini';
+  const dummyQuota = getOrUpdateQuota('__config_test__', false, cfg.AI_RATE_LIMIT_PER_MIN, cfg.AI_RATE_LIMIT_PER_DAY);
 
   if (useGemini) {
     if (!cfg.GEMINI_API_KEY) {
@@ -936,12 +1101,15 @@ export async function testAiConfigurationConnection(adminToken: string): Promise
         provider: 'Google Gemini API (Free Tier)',
         model: cfg.GEMINI_AI_MODEL,
         latencyMs: Date.now() - startedAt,
-        message: 'GEMINI_API_KEY is not configured yet.'
+        statusCode: 503,
+        errorCode: cfg.vaultDecryptError ? 'AI_VAULT_DECRYPT_FAILED' : 'AI_KEY_NOT_CONFIGURED',
+        message: cfg.vaultDecryptError
+          ? 'Encrypted GEMINI_API_KEY exists in vault, but TELEGRAM_ENCRYPTION_KEY failed to decrypt it. Re-save the key or align TELEGRAM_ENCRYPTION_KEY.'
+          : 'GEMINI_API_KEY is not configured yet.'
       };
     }
 
     try {
-      const dummyQuota = getOrUpdateQuota('__config_test__', false, cfg.AI_RATE_LIMIT_PER_MIN, cfg.AI_RATE_LIMIT_PER_DAY);
       const outcome = await generateWithGeminiSdk(
         cfg.GEMINI_API_KEY,
         cfg.GEMINI_AI_MODEL,
@@ -956,6 +1124,7 @@ export async function testAiConfigurationConnection(adminToken: string): Promise
         provider: 'Google Gemini API (Free Tier)',
         model: outcome.model,
         latencyMs: Date.now() - startedAt,
+        statusCode: 200,
         message: `Connected cleanly to ${outcome.model}.`,
         replyPreview: outcome.text.slice(0, 120)
       };
@@ -965,23 +1134,30 @@ export async function testAiConfigurationConnection(adminToken: string): Promise
         provider: 'Google Gemini API (Free Tier)',
         model: cfg.GEMINI_AI_MODEL,
         latencyMs: Date.now() - startedAt,
-        message: err?.message || 'Gemini connection test failed.'
+        statusCode: err instanceof AiServiceError ? err.status : 502,
+        errorCode: err instanceof AiServiceError ? err.code : 'AI_UPSTREAM_ERROR',
+        message: sanitizeErrorMessage(err?.message || 'Gemini connection test failed.', [cfg.GEMINI_API_KEY])
       };
     }
   }
 
   try {
     const outcome = await generateWithOpenAiCompatibleProvider(
-      cfg.AI_PROVIDER,
+      cfg.AI_PROVIDER as 'openrouter' | 'groq',
+      altProviderKey,
+      cfg.GEMINI_AI_MODEL,
+      cfg.GEMINI_FALLBACK_MODEL,
       'Reply concisely with "Skill-Flix AI connection verified."',
       [],
-      'Ping'
+      'Ping',
+      dummyQuota
     );
     return {
       success: true,
       provider: cfg.AI_PROVIDER,
       model: outcome.model,
       latencyMs: Date.now() - startedAt,
+      statusCode: 200,
       message: `Connected cleanly to ${cfg.AI_PROVIDER} (${outcome.model}).`,
       replyPreview: outcome.text.slice(0, 120)
     };
@@ -991,7 +1167,9 @@ export async function testAiConfigurationConnection(adminToken: string): Promise
       provider: cfg.AI_PROVIDER,
       model: process.env.AI_MODEL || cfg.GEMINI_AI_MODEL,
       latencyMs: Date.now() - startedAt,
-      message: err?.message || 'Provider connection test failed.'
+      statusCode: err instanceof AiServiceError ? err.status : 502,
+      errorCode: err instanceof AiServiceError ? err.code : 'AI_UPSTREAM_ERROR',
+      message: sanitizeErrorMessage(err?.message || 'Provider connection test failed.', [altProviderKey])
     };
   }
 }

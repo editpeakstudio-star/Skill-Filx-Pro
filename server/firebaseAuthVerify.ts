@@ -33,15 +33,36 @@ function base64UrlDecode(segment: string): Buffer {
   return Buffer.from(padded, 'base64');
 }
 
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = 8000
+): Promise<globalThis.Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      throw new Error(`Firebase network request timed out after ${Math.round(timeoutMs / 1000)}s.`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function getGooglePublicCerts(forceRefresh = false): Promise<Record<string, string>> {
   const now = Date.now();
   if (!forceRefresh && certCache && certCache.expiresAt > now) {
     return certCache.certs;
   }
 
-  const response = await fetch(GOOGLE_CERTS_URL, {
-    headers: { Accept: 'application/json' }
-  });
+  const response = await fetchWithTimeout(
+    GOOGLE_CERTS_URL,
+    { headers: { Accept: 'application/json' } },
+    8000
+  );
   if (!response.ok) {
     throw new Error(`Failed to fetch Firebase public keys (${response.status}).`);
   }
@@ -227,12 +248,16 @@ export async function fetchFirestoreDocument(
   docId: string,
   idToken: string
 ): Promise<Record<string, unknown> | null> {
-  const res = await fetch(firestoreDocUrl(collection, docId), {
-    headers: {
-      Authorization: `Bearer ${idToken}`,
-      Accept: 'application/json'
-    }
-  });
+  const res = await fetchWithTimeout(
+    firestoreDocUrl(collection, docId),
+    {
+      headers: {
+        Authorization: `Bearer ${idToken}`,
+        Accept: 'application/json'
+      }
+    },
+    8000
+  );
   if (res.status === 404) return null;
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -254,12 +279,16 @@ export async function listFirestoreCollection(
     url.searchParams.set('pageSize', '200');
     if (pageToken) url.searchParams.set('pageToken', pageToken);
 
-    const res = await fetch(url.toString(), {
-      headers: {
-        Authorization: `Bearer ${idToken}`,
-        Accept: 'application/json'
-      }
-    });
+    const res = await fetchWithTimeout(
+      url.toString(),
+      {
+        headers: {
+          Authorization: `Bearer ${idToken}`,
+          Accept: 'application/json'
+        }
+      },
+      8000
+    );
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       throw new Error(`Firestore list failed (${res.status}): ${text.slice(0, 200)}`);
@@ -293,14 +322,18 @@ export async function upsertFirestoreDocument(
     }
   }
 
-  const res = await fetch(firestoreDocUrl(collection, docId), {
-    method: 'PATCH',
-    headers: {
-      Authorization: `Bearer ${idToken}`,
-      'Content-Type': 'application/json'
+  const res = await fetchWithTimeout(
+    firestoreDocUrl(collection, docId),
+    {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${idToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ fields })
     },
-    body: JSON.stringify({ fields })
-  });
+    8000
+  );
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     throw new Error(`Firestore upsert failed (${res.status}): ${text.slice(0, 200)}`);
@@ -312,12 +345,16 @@ export async function deleteFirestoreDocument(
   docId: string,
   idToken: string
 ): Promise<void> {
-  const res = await fetch(firestoreDocUrl(collection, docId), {
-    method: 'DELETE',
-    headers: {
-      Authorization: `Bearer ${idToken}`
-    }
-  });
+  const res = await fetchWithTimeout(
+    firestoreDocUrl(collection, docId),
+    {
+      method: 'DELETE',
+      headers: {
+        Authorization: `Bearer ${idToken}`
+      }
+    },
+    8000
+  );
   if (res.status === 404) return;
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -443,16 +480,20 @@ export async function getServerServiceAccountToken(): Promise<string | null> {
   signer.end();
   const sig = b64u(signer.sign(privateKeyRaw));
 
-  const res = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-      assertion: `${header}.${claims}.${sig}`
-    }).toString()
-  });
+  const res = await fetchWithTimeout(
+    'https://oauth2.googleapis.com/token',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+        assertion: `${header}.${claims}.${sig}`
+      }).toString()
+    },
+    8000
+  ).catch(() => null);
 
-  if (!res.ok) return null;
+  if (!res || !res.ok) return null;
   const json = (await res.json()) as { access_token?: string; expires_in?: number };
   if (!json.access_token) return null;
 

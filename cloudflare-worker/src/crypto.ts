@@ -135,11 +135,15 @@ export function sanitizeError(message: string, knownSecrets: string[] = []): str
   let clean = String(message || 'Unknown error');
   for (const s of knownSecrets) {
     if (s && s.trim()) {
-      clean = clean.split(s.trim()).join('[REDACTED_TOKEN]');
+      clean = clean.split(s.trim()).join('[REDACTED_KEY]');
     }
   }
   clean = clean.replace(/bot\d{6,16}:[A-Za-z0-9_-]{12,}/gi, 'bot[REDACTED_TOKEN]');
   clean = clean.replace(/\d{6,16}:[A-Za-z0-9_-]{15,}/g, '[REDACTED_TOKEN]');
+  clean = clean.replace(/AIza[0-9A-Za-z_-]{16,}/g, '[REDACTED_API_KEY]');
+  clean = clean.replace(/\bAQ\.[A-Za-z0-9._-]{16,}/g, '[REDACTED_API_KEY]');
+  clean = clean.replace(/\b(?:gsk_|sk-or-v1-|sk-)[A-Za-z0-9._-]{16,}/g, '[REDACTED_API_KEY]');
+  clean = clean.replace(/Bearer\s+[A-Za-z0-9._-]{16,}/gi, 'Bearer [REDACTED_TOKEN]');
   return clean;
 }
 
