@@ -56,7 +56,8 @@ import {
   ZoomOut,
   RotateCcw,
   Unlock,
-  Clock
+  Clock,
+  ExternalLink
 } from 'lucide-react';
 import { 
   UserProfile, 
@@ -91,6 +92,7 @@ import {
   savePdf, 
   togglePdfPublish, 
   deletePdf,
+  validatePdfUrl,
   updateAdminRoleAndPermissions,
   toggleAdminSuspension,
   toggleStudentAccountStatus,
@@ -174,6 +176,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
 
   const [editingVideo, setEditingVideo] = useState<Partial<VideoLesson> | null>(null);
   const [editingPdf, setEditingPdf] = useState<Partial<PdfResource> | null>(null);
+  const [isSavingPdf, setIsSavingPdf] = useState(false);
   const [editingCategory, setEditingCategory] = useState<Partial<Category> | null>(null);
   const [viewingProof, setViewingProof] = useState<PaymentRequest | null>(null);
   const [rejectNote, setRejectNote] = useState('');
@@ -881,12 +884,37 @@ export const AdminView: React.FC<AdminViewProps> = ({
       return;
     }
 
+    const urlValidation = validatePdfUrl(editingPdf.pdfUrl);
+    if (!urlValidation.valid) {
+      showToast(urlValidation.error || 'Please enter a valid PDF Document URL.', 'error');
+      return;
+    }
+
+    const matchedCategory = categories.find(c => c.id === editingPdf.categoryId);
+    const cleanPayload: Partial<PdfResource> & { title: string; categoryId: string } = {
+      ...editingPdf,
+      title: editingPdf.title.trim(),
+      description: (editingPdf.description || '').trim(),
+      categoryId: editingPdf.categoryId.trim(),
+      categoryName: (editingPdf.categoryName || matchedCategory?.name || '').trim(),
+      folderId: (editingPdf.folderId || editingPdf.categoryId).trim(),
+      folderName: (editingPdf.folderName || '').trim(),
+      pdfUrl: urlValidation.normalizedUrl,
+      thumbnailUrl: (editingPdf.thumbnailUrl || '').trim(),
+      pageCount: editingPdf.pageCount && Number(editingPdf.pageCount) > 0 ? Number(editingPdf.pageCount) : 12,
+      fileSize: (editingPdf.fileSize || '').trim() || 'PDF',
+      isPublished: editingPdf.isPublished !== undefined ? editingPdf.isPublished : true
+    };
+
+    setIsSavingPdf(true);
     try {
-      await savePdf(editingPdf as any);
+      await savePdf(cleanPayload);
       showToast('PDF guide saved successfully!', 'success');
       setEditingPdf(null);
     } catch (err: any) {
       showToast(err.message || 'Failed to save PDF.', 'error');
+    } finally {
+      setIsSavingPdf(false);
     }
   };
 
@@ -937,7 +965,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
   const filteredPdfs = pdfs.filter(p => {
     if (!pdfSearch) return true;
     const q = pdfSearch.toLowerCase();
-    return p.title.toLowerCase().includes(q) || p.categoryName.toLowerCase().includes(q);
+    return (p.title || '').toLowerCase().includes(q) || (p.categoryName || '').toLowerCase().includes(q);
   });
 
   const sevenDaysAgoMs = Date.now() - 7 * 24 * 60 * 60 * 1000;
@@ -2190,8 +2218,12 @@ export const AdminView: React.FC<AdminViewProps> = ({
                 onClick={() => setEditingPdf({
                   categoryId: categories[0]?.id || '',
                   categoryName: categories[0]?.name || '',
+                  description: '',
+                  pdfUrl: '',
+                  thumbnailUrl: '',
                   isPublished: true,
-                  pageCount: 10
+                  pageCount: 12,
+                  fileSize: 'PDF'
                 })}
                 className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold shadow-md cursor-pointer"
               >
@@ -2204,21 +2236,40 @@ export const AdminView: React.FC<AdminViewProps> = ({
               {filteredPdfs.map((pdf) => (
                 <div
                   key={pdf.id}
-                  className="p-3 rounded-2xl bg-[#090D16] border border-zinc-800/80 flex items-center justify-between"
+                  className="p-3 rounded-2xl bg-[#090D16] border border-zinc-800/80 flex items-center justify-between gap-3"
                 >
-                  <div className="flex items-center gap-3">
-                    <div className="w-9 h-9 rounded-xl bg-red-500/10 text-red-400 flex items-center justify-center shrink-0">
-                      <FileText className="w-4 h-4" />
-                    </div>
-                    <div>
-                      <span className="text-xs font-bold text-white block">{pdf.title}</span>
-                      <span className="text-[10px] text-zinc-400 font-mono">
-                        {pdf.categoryName} • {pdf.pageCount} Pages • {pdf.fileSize}
+                  <div className="flex items-center gap-3 min-w-0">
+                    {pdf.thumbnailUrl ? (
+                      <img
+                        src={pdf.thumbnailUrl}
+                        alt={pdf.title}
+                        className="w-9 h-9 rounded-xl object-cover border border-white/10 shrink-0"
+                      />
+                    ) : (
+                      <div className="w-9 h-9 rounded-xl bg-red-500/10 text-red-400 flex items-center justify-center shrink-0">
+                        <FileText className="w-4 h-4" />
+                      </div>
+                    )}
+                    <div className="min-w-0">
+                      <span className="text-xs font-bold text-white block truncate">{pdf.title}</span>
+                      <span className="text-[10px] text-zinc-400 font-mono block truncate">
+                        {pdf.categoryName || 'Study Material'} • {pdf.pageCount || 12} Pages • {pdf.fileSize || 'PDF'}
                       </span>
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 shrink-0">
+                    {pdf.pdfUrl && (
+                      <a
+                        href={pdf.pdfUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="p-1 rounded text-zinc-400 hover:text-cyan-400"
+                        title="Open PDF link"
+                      >
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      </a>
+                    )}
                     <button
                       type="button"
                       onClick={() => togglePdfPublish(pdf.id, !pdf.isPublished)}
@@ -2230,8 +2281,13 @@ export const AdminView: React.FC<AdminViewProps> = ({
                     </button>
                     <button
                       type="button"
-                      onClick={() => setEditingPdf(pdf)}
+                      onClick={() => setEditingPdf({
+                        ...pdf,
+                        thumbnailUrl: pdf.thumbnailUrl || '',
+                        description: pdf.description || ''
+                      })}
                       className="p-1 rounded text-zinc-400 hover:text-white"
+                      title="Edit PDF"
                     >
                       <Edit2 className="w-3.5 h-3.5" />
                     </button>
@@ -2241,6 +2297,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
                         if (confirm(`Delete PDF "${pdf.title}"?`)) deletePdf(pdf.id);
                       }}
                       className="p-1 rounded text-zinc-400 hover:text-rose-400"
+                      title="Delete PDF"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
                     </button>
@@ -4358,12 +4415,14 @@ export const AdminView: React.FC<AdminViewProps> = ({
       {/* MODAL: CREATE / EDIT PDF                                 */}
       {/* ======================================================== */}
       {editingPdf && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/90">
-          <div className="relative w-full max-w-sm bg-[#0B0F19] border border-blue-500/30 rounded-2xl p-5 text-white">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/90 overflow-y-auto">
+          <div className="relative w-full max-w-sm bg-[#0B0F19] border border-blue-500/30 rounded-2xl p-5 text-white my-6">
             <button onClick={() => setEditingPdf(null)} className="absolute top-3.5 right-3.5 p-1 rounded-lg bg-zinc-800 text-zinc-400 hover:text-white cursor-pointer">
               <X className="w-4 h-4" />
             </button>
-            <h3 className="font-bold text-sm mb-3">Upload PDF Resource</h3>
+            <h3 className="font-bold text-sm mb-3">
+              {editingPdf.id ? 'Edit PDF Resource' : 'Upload PDF Resource'}
+            </h3>
             <form onSubmit={handleSavePdfSubmit} className="space-y-3 text-xs">
               <div>
                 <label className="block text-zinc-300 mb-1 font-semibold">Title *</label>
@@ -4372,7 +4431,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
                   required
                   value={editingPdf.title || ''}
                   onChange={e => setEditingPdf({ ...editingPdf, title: e.target.value })}
-                  placeholder="e.g. Speed Curves Formula Guide"
+                  placeholder="e.g. Assets Used in This Video"
                   className="w-full px-3 py-2 rounded-xl bg-[#05070D] border border-blue-500/25 text-white outline-none"
                 />
               </div>
@@ -4384,7 +4443,13 @@ export const AdminView: React.FC<AdminViewProps> = ({
                   value={editingPdf.categoryId || ''}
                   onChange={e => {
                     const c = categories.find(cat => cat.id === e.target.value);
-                    setEditingPdf({ ...editingPdf, categoryId: e.target.value, categoryName: c?.name || '' });
+                    setEditingPdf({
+                      ...editingPdf,
+                      categoryId: e.target.value,
+                      categoryName: c?.name || '',
+                      folderId: e.target.value,
+                      folderName: ''
+                    });
                   }}
                   className="w-full px-3 py-2 rounded-xl bg-[#05070D] border border-blue-500/25 text-white outline-none"
                 >
@@ -4400,15 +4465,49 @@ export const AdminView: React.FC<AdminViewProps> = ({
                   required
                   value={editingPdf.pdfUrl || ''}
                   onChange={e => setEditingPdf({ ...editingPdf, pdfUrl: e.target.value })}
+                  placeholder="https://drive.google.com/file/d/... or direct .pdf link"
                   className="w-full px-3 py-2 rounded-xl bg-[#05070D] border border-blue-500/25 text-white outline-none font-mono"
                 />
               </div>
 
+              <div>
+                <label className="block text-zinc-300 mb-1 font-semibold">Thumbnail URL (Optional)</label>
+                <input
+                  type="url"
+                  value={editingPdf.thumbnailUrl || ''}
+                  onChange={e => setEditingPdf({ ...editingPdf, thumbnailUrl: e.target.value })}
+                  placeholder="Leave blank if none"
+                  className="w-full px-3 py-2 rounded-xl bg-[#05070D] border border-blue-500/25 text-white outline-none font-mono"
+                />
+              </div>
+
+              <div>
+                <label className="block text-zinc-300 mb-1 font-semibold">Description (Optional)</label>
+                <textarea
+                  rows={2}
+                  value={editingPdf.description || ''}
+                  onChange={e => setEditingPdf({ ...editingPdf, description: e.target.value })}
+                  placeholder="Short study note or resource summary..."
+                  className="w-full px-3 py-2 rounded-xl bg-[#05070D] border border-blue-500/25 text-white outline-none"
+                />
+              </div>
+
+              <label className="flex items-center gap-2 cursor-pointer pt-1">
+                <input
+                  type="checkbox"
+                  checked={editingPdf.isPublished ?? true}
+                  onChange={e => setEditingPdf({ ...editingPdf, isPublished: e.target.checked })}
+                  className="rounded border-zinc-700 text-blue-600"
+                />
+                <span className="font-semibold text-zinc-200">Published (visible to enrolled students)</span>
+              </label>
+
               <button
                 type="submit"
-                className="w-full py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs shadow-md cursor-pointer mt-2"
+                disabled={isSavingPdf}
+                className="w-full py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-60 text-white font-bold text-xs shadow-md cursor-pointer mt-2"
               >
-                Save PDF Guide
+                {isSavingPdf ? 'Saving PDF Guide...' : 'Save PDF Guide'}
               </button>
             </form>
           </div>

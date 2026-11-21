@@ -32,8 +32,8 @@ export const PdfsView: React.FC<PdfsViewProps> = ({
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
       return (
-        p.title.toLowerCase().includes(q) ||
-        p.categoryName.toLowerCase().includes(q)
+        (p.title || '').toLowerCase().includes(q) ||
+        (p.categoryName || '').toLowerCase().includes(q)
       );
     }
     return true;
@@ -104,9 +104,17 @@ export const PdfsView: React.FC<PdfsViewProps> = ({
               >
                 <div>
                   <div className="flex items-start justify-between gap-3 mb-3">
-                    <div className="w-10 h-10 rounded-xl bg-red-500/10 text-red-400 border border-red-500/20 flex items-center justify-center shrink-0 group-hover:scale-105 transition-transform">
-                      <FileText className="w-5 h-5" />
-                    </div>
+                    {pdf.thumbnailUrl ? (
+                      <img
+                        src={pdf.thumbnailUrl}
+                        alt={pdf.title}
+                        className="w-10 h-10 rounded-xl object-cover border border-white/10 shrink-0 group-hover:scale-105 transition-transform"
+                      />
+                    ) : (
+                      <div className="w-10 h-10 rounded-xl bg-red-500/10 text-red-400 border border-red-500/20 flex items-center justify-center shrink-0 group-hover:scale-105 transition-transform">
+                        <FileText className="w-5 h-5" />
+                      </div>
+                    )}
                     {unlocked ? (
                       <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
                         Unlocked
@@ -119,7 +127,7 @@ export const PdfsView: React.FC<PdfsViewProps> = ({
                   </div>
 
                   <span className="text-[10px] text-blue-400 font-bold uppercase tracking-wider block mb-1">
-                    {pdf.categoryName}
+                    {pdf.categoryName || catObj?.name || 'Study Material'}
                   </span>
                   <h3 className="text-sm font-bold text-white group-hover:text-blue-400 transition-colors line-clamp-2">
                     {pdf.title}

@@ -935,10 +935,30 @@ function firebaseAuthMessage(err: any, fallback: string): Error {
   return new Error(err?.message || fallback);
 }
 
+function stripUndefinedFields<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((item) => stripUndefinedFields(item)) as unknown as T;
+  }
+  if (value !== null && typeof value === 'object') {
+    const proto = Object.getPrototypeOf(value);
+    if (proto === Object.prototype || proto === null) {
+      const cleaned: Record<string, any> = {};
+      Object.entries(value as Record<string, any>).forEach(([key, val]) => {
+        if (val !== undefined) {
+          cleaned[key] = stripUndefinedFields(val);
+        }
+      });
+      return cleaned as T;
+    }
+  }
+  return value;
+}
+
 async function persistAdminDocument(collectionName: string, id: string, data: Record<string, any>, merge = true): Promise<void> {
   if (!db || !auth?.currentUser) throw new Error('Sign in as an authorized administrator with an active Firebase connection to save changes.');
+  const sanitized = stripUndefinedFields(data);
   try {
-    await setDoc(doc(db, collectionName, id), data, { merge });
+    await setDoc(doc(db, collectionName, id), sanitized, { merge });
   } catch (err: any) {
     throw firebaseAuthMessage(err, 'Firebase rejected this change. No local success was recorded.');
   }
@@ -946,8 +966,9 @@ async function persistAdminDocument(collectionName: string, id: string, data: Re
 
 async function updateAdminDocument(collectionName: string, id: string, data: Record<string, any>): Promise<void> {
   if (!db || !auth?.currentUser) throw new Error('Sign in as an authorized administrator with an active Firebase connection to save changes.');
+  const sanitized = stripUndefinedFields(data);
   try {
-    await updateDoc(doc(db, collectionName, id), data);
+    await updateDoc(doc(db, collectionName, id), sanitized);
   } catch (err: any) {
     throw firebaseAuthMessage(err, 'Firebase rejected this change. No local success was recorded.');
   }
@@ -1973,11 +1994,147 @@ export async function deleteVideo(videoId: string): Promise<void> {
 // PDF RESOURCES SERVICE
 // ==========================================
 
+export function validatePdfUrl(rawUrl?: string | null): {
+  valid: boolean;
+  normalizedUrl: string;
+  error?: string;
+} {
+  const trimmed = typeof rawUrl === 'string' ? rawUrl.trim() : '';
+  if (!trimmed) {
+    return {
+      valid: false,
+      normalizedUrl: '',
+      error: 'PDF Document URL is required.'
+    };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return {
+      valid: false,
+      normalizedUrl: '',
+      error: 'Enter a valid PDF URL starting with https:// or http://'
+    };
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return {
+      valid: false,
+      normalizedUrl: '',
+      error: 'PDF Document URL must use https:// or http://'
+    };
+  }
+
+  const host = parsed.hostname.toLowerCase();
+  if (!host || (!host.includes('.') && host !== 'localhost')) {
+    return {
+      valid: false,
+      normalizedUrl: '',
+      error: 'Enter a valid PDF domain (for example drive.google.com or your file host).'
+    };
+  }
+
+  return {
+    valid: true,
+    normalizedUrl: parsed.toString()
+  };
+}
+
+export function extractGoogleDriveFileId(rawUrl?: string | null): string | null {
+  const trimmed = typeof rawUrl === 'string' ? rawUrl.trim() : '';
+  if (!trimmed) return null;
+
+  try {
+    const parsed = new URL(trimmed);
+    const host = parsed.hostname.toLowerCase();
+    if (!host.includes('drive.google.com') && !host.includes('docs.google.com')) {
+      return null;
+    }
+
+    const pathMatch = parsed.pathname.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
+    if (pathMatch?.[1]) return pathMatch[1];
+
+    const docMatch = parsed.pathname.match(/\/d\/([a-zA-Z0-9_-]+)/);
+    if (docMatch?.[1]) return docMatch[1];
+
+    const queryId = parsed.searchParams.get('id');
+    if (queryId && /^[a-zA-Z0-9_-]+$/.test(queryId)) return queryId;
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+export function getPdfViewerLinks(rawUrl?: string | null): {
+  embedUrl: string;
+  openUrl: string;
+  downloadUrl: string;
+  isGoogleDrive: boolean;
+} {
+  const trimmed = typeof rawUrl === 'string' ? rawUrl.trim() : '';
+  if (!trimmed) {
+    return { embedUrl: '', openUrl: '', downloadUrl: '', isGoogleDrive: false };
+  }
+
+  const driveId = extractGoogleDriveFileId(trimmed);
+  if (driveId) {
+    return {
+      embedUrl: `https://drive.google.com/file/d/${driveId}/preview`,
+      openUrl: trimmed,
+      downloadUrl: `https://drive.google.com/uc?export=download&id=${driveId}`,
+      isGoogleDrive: true
+    };
+  }
+
+  const embedUrl = trimmed.includes('#') ? trimmed : `${trimmed}#toolbar=0`;
+  return {
+    embedUrl,
+    openUrl: trimmed,
+    downloadUrl: trimmed,
+    isGoogleDrive: false
+  };
+}
+
+function normalizePdfResource(id: string, rawData: Record<string, any>): PdfResource {
+  const categoryId = typeof rawData.categoryId === 'string' ? rawData.categoryId.trim() : '';
+  const folderId = typeof rawData.folderId === 'string' && rawData.folderId.trim()
+    ? rawData.folderId.trim()
+    : categoryId;
+  const pageNum = Number(rawData.pageCount);
+  const orderNum = Number(rawData.order);
+
+  return {
+    id,
+    title: typeof rawData.title === 'string' ? rawData.title.trim() : 'Untitled PDF',
+    description: typeof rawData.description === 'string' ? rawData.description.trim() : '',
+    categoryId,
+    categoryName: typeof rawData.categoryName === 'string' ? rawData.categoryName.trim() : '',
+    folderId,
+    folderName: typeof rawData.folderName === 'string' ? rawData.folderName.trim() : '',
+    pdfUrl: typeof rawData.pdfUrl === 'string' ? rawData.pdfUrl.trim() : '',
+    thumbnailUrl: typeof rawData.thumbnailUrl === 'string' ? rawData.thumbnailUrl.trim() : '',
+    pageCount: Number.isFinite(pageNum) && pageNum > 0 ? Math.round(pageNum) : 12,
+    fileSize: typeof rawData.fileSize === 'string' && rawData.fileSize.trim() ? rawData.fileSize.trim() : 'PDF',
+    isPublished: typeof rawData.isPublished === 'boolean' ? rawData.isPublished : true,
+    order: Number.isFinite(orderNum) ? orderNum : 0,
+    createdAt: typeof rawData.createdAt === 'string' && rawData.createdAt.trim()
+      ? rawData.createdAt.trim()
+      : new Date().toISOString(),
+    updatedAt: typeof rawData.updatedAt === 'string' && rawData.updatedAt.trim()
+      ? rawData.updatedAt.trim()
+      : new Date().toISOString()
+  };
+}
+
 export function subscribeToPdfs(callback: (pdfs: PdfResource[]) => void, includeUnpublished = false): () => void {
   const loadLocal = () => {
     cleanUnwantedLocalRecords();
     const map = readStorage<Record<string, PdfResource>>(STORAGE_KEYS.PDFS, {});
     const list = Object.values(map)
+      .map(pdf => normalizePdfResource(pdf.id, pdf))
       .filter(pdf => !UNWANTED_DEMO_PDF_IDS.has(pdf.id) && (includeUnpublished || pdf.isPublished))
       .sort((a, b) => (a.order || 0) - (b.order || 0));
     callback(list);
@@ -1985,15 +2142,19 @@ export function subscribeToPdfs(callback: (pdfs: PdfResource[]) => void, include
   loadLocal();
 
   const unsubEvent = eventBus.subscribe<PdfResource[]>('pdfs', items => {
-    callback(items.filter(pdf => !UNWANTED_DEMO_PDF_IDS.has(pdf.id) && (includeUnpublished || pdf.isPublished)));
+    callback(
+      items
+        .map(pdf => normalizePdfResource(pdf.id, pdf))
+        .filter(pdf => !UNWANTED_DEMO_PDF_IDS.has(pdf.id) && (includeUnpublished || pdf.isPublished))
+    );
   });
 
   let unsubFb: (() => void) | null = null;
-  if (db && isFirebaseOnline) {
+  if (db && isFirebaseOnline && auth?.currentUser?.uid) {
     let cancelled = false;
     const listeners: (() => void)[] = [];
     const results: Record<number, Record<string, PdfResource>> = {};
-    void getDoc(doc(db, 'users', auth?.currentUser?.uid || '')).then((userSnap) => {
+    void getDoc(doc(db, 'users', auth.currentUser.uid)).then((userSnap) => {
       if (cancelled) return;
       const userData = userSnap.exists() ? userSnap.data() : {};
       const normalized = normalizeUserProfile(auth?.currentUser?.uid || '', userData, auth?.currentUser);
@@ -2024,7 +2185,7 @@ export function subscribeToPdfs(callback: (pdfs: PdfResource[]) => void, include
               }
               return;
             }
-            results[index][docSnap.id] = { id: docSnap.id, ...docSnap.data() } as PdfResource;
+            results[index][docSnap.id] = normalizePdfResource(docSnap.id, docSnap.data());
           });
           const remote = Object.assign({}, ...Object.values(results)) as Record<string, PdfResource>;
           UNWANTED_DEMO_PDF_IDS.forEach(id => delete remote[id]);
@@ -2044,31 +2205,105 @@ export function subscribeToPdfs(callback: (pdfs: PdfResource[]) => void, include
 }
 
 export async function savePdf(pdf: Partial<PdfResource> & { title: string; categoryId: string }): Promise<PdfResource> {
-  const pdfs = readStorage<Record<string, PdfResource>>(STORAGE_KEYS.PDFS, {});
-  const id = pdf.id || `pdf_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+  const cleanTitle = typeof pdf.title === 'string' ? pdf.title.trim() : '';
+  const cleanCategoryId = typeof pdf.categoryId === 'string' ? pdf.categoryId.trim() : '';
+  if (!cleanTitle) {
+    throw new Error('PDF title is required.');
+  }
+  if (!cleanCategoryId) {
+    throw new Error('Please select a category for this PDF resource.');
+  }
 
+  const urlCheck = validatePdfUrl(pdf.pdfUrl);
+  if (!urlCheck.valid) {
+    throw new Error(urlCheck.error || 'Enter a valid PDF document URL.');
+  }
+
+  const pdfs = readStorage<Record<string, PdfResource>>(STORAGE_KEYS.PDFS, {});
+  const id = (typeof pdf.id === 'string' && pdf.id.trim())
+    ? pdf.id.trim()
+    : `pdf_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+
+  const existing = pdfs[id];
   const categories = readStorage<Record<string, Category>>(STORAGE_KEYS.CATEGORIES, {});
-  const categoryName = pdf.categoryName || categories[pdf.categoryId]?.name || 'Study Material';
+  let resolvedCategoryName = (
+    (typeof pdf.categoryName === 'string' ? pdf.categoryName.trim() : '') ||
+    (categories[cleanCategoryId]?.name || '').trim() ||
+    (existing?.categoryName || '').trim()
+  );
+
+  if (!resolvedCategoryName && db && isFirebaseOnline) {
+    try {
+      const catSnap = await getDoc(doc(db, 'categories', cleanCategoryId));
+      if (catSnap.exists()) {
+        const catData = catSnap.data();
+        if (typeof catData.name === 'string' && catData.name.trim()) {
+          resolvedCategoryName = catData.name.trim();
+        }
+      }
+    } catch {
+      // Ignore lookup fallback errors and default below
+    }
+  }
+  if (!resolvedCategoryName) {
+    resolvedCategoryName = 'Study Material';
+  }
+
+  const folders = readStorage<Record<string, Folder>>(STORAGE_KEYS.FOLDERS, {});
+  const rawFolderId = typeof pdf.folderId === 'string' && pdf.folderId.trim()
+    ? pdf.folderId.trim()
+    : (existing?.folderId || cleanCategoryId);
+  const resolvedFolderName = typeof pdf.folderName === 'string' && pdf.folderName.trim()
+    ? pdf.folderName.trim()
+    : (rawFolderId !== cleanCategoryId ? (folders[rawFolderId]?.name || existing?.folderName || '') : '');
+
+  const parsedPageCount = Number(pdf.pageCount ?? existing?.pageCount);
+  const safePageCount = Number.isFinite(parsedPageCount) && parsedPageCount > 0
+    ? Math.round(parsedPageCount)
+    : 12;
+
+  const parsedOrder = Number(pdf.order ?? existing?.order);
+  const safeOrder = Number.isFinite(parsedOrder)
+    ? parsedOrder
+    : Object.values(pdfs).length + 1;
+
+  const safeThumbnailUrl = typeof pdf.thumbnailUrl === 'string' && pdf.thumbnailUrl.trim()
+    ? pdf.thumbnailUrl.trim()
+    : '';
+
+  const safeDescription = typeof pdf.description === 'string'
+    ? pdf.description.trim()
+    : (existing?.description || '');
+
+  const safeFileSize = typeof pdf.fileSize === 'string' && pdf.fileSize.trim()
+    ? pdf.fileSize.trim()
+    : (existing?.fileSize || 'PDF');
+
+  const safeCreatedAt = typeof pdf.createdAt === 'string' && pdf.createdAt.trim()
+    ? pdf.createdAt.trim()
+    : (existing?.createdAt || new Date().toISOString());
 
   const updated: PdfResource = {
     id,
-    title: pdf.title.trim(),
-    description: pdf.description || '',
-    categoryId: pdf.categoryId,
-    categoryName,
-    folderId: pdf.folderId || pdf.categoryId,
-    folderName: pdf.folderName || '',
-    pdfUrl: pdf.pdfUrl || 'https://raw.githubusercontent.com/mozilla/pdf.js/ba2edeae/web/compressed.tracemonkey-pldi-09.pdf',
-    thumbnailUrl: pdf.thumbnailUrl,
-    pageCount: pdf.pageCount || 12,
-    fileSize: pdf.fileSize || '3.4 MB',
-    isPublished: pdf.isPublished !== undefined ? pdf.isPublished : true,
-    order: pdf.order !== undefined ? pdf.order : Object.values(pdfs).length + 1,
-    createdAt: pdf.createdAt || new Date().toISOString(),
+    title: cleanTitle,
+    description: safeDescription,
+    categoryId: cleanCategoryId,
+    categoryName: resolvedCategoryName,
+    folderId: rawFolderId,
+    folderName: resolvedFolderName,
+    pdfUrl: urlCheck.normalizedUrl,
+    thumbnailUrl: safeThumbnailUrl,
+    pageCount: safePageCount,
+    fileSize: safeFileSize,
+    isPublished: typeof pdf.isPublished === 'boolean'
+      ? pdf.isPublished
+      : (existing?.isPublished !== undefined ? existing.isPublished : true),
+    order: safeOrder,
+    createdAt: safeCreatedAt,
     updatedAt: new Date().toISOString()
   };
 
-  await persistAdminDocument('pdfs', id, updated);
+  await persistAdminDocument('pdfs', id, updated, !existing);
   pdfs[id] = updated;
   writeStorage(STORAGE_KEYS.PDFS, pdfs);
   recalculateCategoryCounts();

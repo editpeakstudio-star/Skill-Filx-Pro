@@ -1,6 +1,7 @@
 import React from 'react';
-import { X, FileText, Download, ExternalLink, ShieldCheck, Lock } from 'lucide-react';
+import { X, FileText, Download, ExternalLink, Lock } from 'lucide-react';
 import { PdfResource, PlatformSettings } from '../types';
+import { getPdfViewerLinks } from '../services/firebase';
 
 interface PdfViewerModalProps {
   isOpen: boolean;
@@ -21,6 +22,8 @@ export const PdfViewerModal: React.FC<PdfViewerModalProps> = ({
 }) => {
   if (!isOpen || !pdf) return null;
 
+  const { embedUrl, openUrl, downloadUrl } = getPdfViewerLinks(pdf.pdfUrl);
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-black/90 backdrop-blur-md">
       <div className="relative w-full max-w-4xl bg-[#090D18] border border-blue-500/20 rounded-2xl sm:rounded-3xl shadow-2xl flex flex-col h-[90vh] overflow-hidden text-slate-100">
@@ -36,23 +39,35 @@ export const PdfViewerModal: React.FC<PdfViewerModalProps> = ({
                 {pdf.title}
               </h3>
               <span className="text-[10px] text-slate-400">
-                {pdf.categoryName} • {pdf.pageCount} Pages • {pdf.fileSize || 'PDF'}
+                {pdf.categoryName || 'Study Material'} • {pdf.pageCount || 12} Pages • {pdf.fileSize || 'PDF'}
               </span>
             </div>
           </div>
 
           <div className="flex items-center gap-2">
-            {hasAccess ? (
-              <a
-                href={pdf.pdfUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shadow-sm transition-all"
-              >
-                <Download className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">Download</span>
-              </a>
-            ) : (
+            {hasAccess && openUrl ? (
+              <>
+                <a
+                  href={openUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-white/10 text-slate-100 text-xs font-semibold transition-all"
+                  title="Open PDF in new tab"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Open Link</span>
+                </a>
+                <a
+                  href={downloadUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shadow-sm transition-all"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Download</span>
+                </a>
+              </>
+            ) : !hasAccess ? (
               <button
                 onClick={onOpenSubscribe}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-black text-xs font-bold transition-all"
@@ -60,7 +75,7 @@ export const PdfViewerModal: React.FC<PdfViewerModalProps> = ({
                 <Lock className="w-3.5 h-3.5" />
                 <span>Unlock Pass</span>
               </button>
-            )}
+            ) : null}
 
             <button
               onClick={onClose}
@@ -75,10 +90,11 @@ export const PdfViewerModal: React.FC<PdfViewerModalProps> = ({
         {/* Content Viewer Body */}
         <div className="flex-1 bg-[#05070D] relative flex items-center justify-center p-4 overflow-hidden">
           {hasAccess ? (
-            pdf.pdfUrl ? (
+            embedUrl ? (
               <iframe
-                src={`${pdf.pdfUrl}#toolbar=0`}
+                src={embedUrl}
                 title={pdf.title}
+                allow="autoplay"
                 className="w-full h-full rounded-xl border border-white/[0.08] bg-white"
               />
             ) : (

@@ -489,9 +489,17 @@ export const CategoryDetailView: React.FC<CategoryDetailViewProps> = ({
                 className="group p-3.5 rounded-2xl bg-[#090D18] border border-blue-500/15 hover:border-red-500/40 transition-all duration-200 cursor-pointer flex flex-col justify-between shadow-md"
               >
                 <div className="flex items-start gap-3">
-                  <div className="w-10 h-10 rounded-xl bg-red-500/10 text-red-400 border border-red-500/20 flex items-center justify-center shrink-0 group-hover:scale-105 transition-transform">
-                    <FileText className="w-5 h-5" />
-                  </div>
+                  {pdf.thumbnailUrl ? (
+                    <img
+                      src={pdf.thumbnailUrl}
+                      alt={pdf.title}
+                      className="w-10 h-10 rounded-xl object-cover border border-white/10 shrink-0 group-hover:scale-105 transition-transform"
+                    />
+                  ) : (
+                    <div className="w-10 h-10 rounded-xl bg-red-500/10 text-red-400 border border-red-500/20 flex items-center justify-center shrink-0 group-hover:scale-105 transition-transform">
+                      <FileText className="w-5 h-5" />
+                    </div>
+                  )}
                   <div className="min-w-0 flex-1">
                     <h3 className="text-xs sm:text-sm font-bold text-white group-hover:text-red-300 transition-colors line-clamp-1">
                       {pdf.title}
