@@ -51,7 +51,22 @@ async function getBearerToken(): Promise<string> {
   return user.getIdToken();
 }
 
-const TELEGRAM_API_BASE = (import.meta.env.VITE_TELEGRAM_API_URL || '').trim().replace(/\/+$/, '');
+const PRODUCTION_WORKER_URL = 'https://skill-flix-telegram-api.editpeakstudio.workers.dev';
+
+function resolveTelegramApiBase(): string {
+  const configured = (import.meta.env.VITE_TELEGRAM_API_URL || '').trim().replace(/\/+$/, '');
+  if (configured) return configured;
+
+  if (typeof window !== 'undefined') {
+    const host = window.location.hostname.toLowerCase();
+    if (host === 'skillflix-academy.web.app' || host === 'skillflix-academy.firebaseapp.com') {
+      return PRODUCTION_WORKER_URL;
+    }
+  }
+  return '';
+}
+
+const TELEGRAM_API_BASE = resolveTelegramApiBase();
 
 function resolveTelegramUrl(path: string): string {
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;

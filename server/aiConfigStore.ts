@@ -49,6 +49,9 @@ interface StoredVaultOverride {
 let memoryOverride: StoredVaultOverride | null = null;
 let firestoreSynced = false;
 let lastLoadAttemptMs = 0;
+let cachedEncryptedPayload = '';
+let cachedDecryptedKey = '';
+let cachedDecryptFailed = false;
 
 function readEnvDefaults(): AiAdminConfigSettings {
   const rawProvider = (process.env.AI_PROVIDER || 'gemini').trim().toLowerCase() as AiProviderType;
@@ -172,6 +175,9 @@ export async function hydrateAiConfigFromFirestore(authToken?: string): Promise<
     const doc = await fetchFirestoreDocument(AI_CONFIG_COLLECTION, AI_CONFIG_DOC_ID, token);
     if (doc) {
       memoryOverride = parseFirestoreDoc(doc);
+      cachedEncryptedPayload = '';
+      cachedDecryptedKey = '';
+      cachedDecryptFailed = false;
     }
     firestoreSynced = true;
   } catch (err) {
@@ -188,11 +194,22 @@ export function getResolvedRuntimeAiConfig(): ResolvedAiRuntimeConfig {
   let vaultKey = '';
   let vaultDecryptError = false;
   if (override?.encryptedGeminiApiKey) {
-    try {
-      vaultKey = decryptBotToken(override.encryptedGeminiApiKey).trim();
-    } catch {
-      vaultKey = '';
-      vaultDecryptError = true;
+    if (cachedEncryptedPayload === override.encryptedGeminiApiKey) {
+      vaultKey = cachedDecryptedKey;
+      vaultDecryptError = cachedDecryptFailed;
+    } else {
+      try {
+        vaultKey = decryptBotToken(override.encryptedGeminiApiKey).trim();
+        cachedEncryptedPayload = override.encryptedGeminiApiKey;
+        cachedDecryptedKey = vaultKey;
+        cachedDecryptFailed = false;
+      } catch {
+        vaultKey = '';
+        vaultDecryptError = true;
+        cachedEncryptedPayload = override.encryptedGeminiApiKey;
+        cachedDecryptedKey = '';
+        cachedDecryptFailed = true;
+      }
     }
   }
 
@@ -314,6 +331,9 @@ export async function saveAdminAiConfig(
     updatedAt: nowIso,
     updatedByEmail: admin.email
   };
+  cachedEncryptedPayload = '';
+  cachedDecryptedKey = '';
+  cachedDecryptFailed = false;
   firestoreSynced = true;
 
   return getAdminAiConfigView(admin.idToken);

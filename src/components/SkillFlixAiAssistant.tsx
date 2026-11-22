@@ -7,6 +7,7 @@ import {
   RefreshCw,
   Send,
   Sparkles,
+  Square,
   Trash2,
   X,
   AlertCircle
@@ -15,7 +16,7 @@ import type { AiChatMessage, AiQuotaInfo, AiStatusResponse, UserProfile } from '
 import {
   AiClientError,
   fetchSkillFlixAiStatus,
-  sendSkillFlixAiMessage
+  streamSkillFlixAiMessage
 } from '../services/aiApi';
 
 interface SkillFlixAiAssistantProps {
@@ -71,12 +72,28 @@ function renderInlineSegments(line: string, keyPrefix: string): React.ReactNode[
   });
 }
 
-function FormattedAiText({ text }: { text: string }) {
+function FormattedAiText({ text, isStreaming }: { text: string; isStreaming?: boolean }) {
   const lines = text.split('\n');
+  let lastNonEmptyIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim()) {
+      lastNonEmptyIdx = i;
+      break;
+    }
+  }
+
+  const cursor = isStreaming ? (
+    <span
+      aria-hidden="true"
+      className="inline-block w-1.5 h-3.5 ml-1 align-middle bg-cyan-400 rounded-[1px] animate-pulse"
+    />
+  ) : null;
+
   return (
     <div className="space-y-1.5 text-[13px] leading-relaxed text-slate-100 break-words">
       {lines.map((rawLine, index) => {
         const trimmed = rawLine.trim();
+        const showCursor = isStreaming && index === lastNonEmptyIdx;
         if (!trimmed) {
           return <div key={`sp_${index}`} className="h-1" />;
         }
@@ -86,7 +103,10 @@ function FormattedAiText({ text }: { text: string }) {
           return (
             <div key={`li_${index}`} className="flex items-start gap-2 pl-1">
               <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-cyan-400 shrink-0" />
-              <span className="flex-1">{renderInlineSegments(bulletMatch[1], `b_${index}`)}</span>
+              <span className="flex-1">
+                {renderInlineSegments(bulletMatch[1], `b_${index}`)}
+                {showCursor && cursor}
+              </span>
             </div>
           );
         }
@@ -96,7 +116,10 @@ function FormattedAiText({ text }: { text: string }) {
           return (
             <div key={`num_${index}`} className="flex items-start gap-2 pl-0.5">
               <span className="text-cyan-300 font-semibold shrink-0">{numberedMatch[1]}</span>
-              <span className="flex-1">{renderInlineSegments(numberedMatch[2], `n_${index}`)}</span>
+              <span className="flex-1">
+                {renderInlineSegments(numberedMatch[2], `n_${index}`)}
+                {showCursor && cursor}
+              </span>
             </div>
           );
         }
@@ -106,12 +129,19 @@ function FormattedAiText({ text }: { text: string }) {
           return (
             <div key={`hd_${index}`} className="font-bold text-cyan-200 pt-0.5">
               {renderInlineSegments(headingMatch[1], `h_${index}`)}
+              {showCursor && cursor}
             </div>
           );
         }
 
-        return <p key={`p_${index}`}>{renderInlineSegments(trimmed, `p_${index}`)}</p>;
+        return (
+          <p key={`p_${index}`}>
+            {renderInlineSegments(trimmed, `p_${index}`)}
+            {showCursor && cursor}
+          </p>
+        );
       })}
+      {isStreaming && lastNonEmptyIdx === -1 && cursor}
     </div>
   );
 }
@@ -130,11 +160,12 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
   const [statusInfo, setStatusInfo] = useState<AiStatusResponse | null>(null);
   const [quota, setQuota] = useState<AiQuotaInfo | null>(null);
 
-  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const messagesScrollRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const activeControllerRef = useRef<AbortController | null>(null);
   const requestSeqRef = useRef(0);
   const inFlightRef = useRef(false);
+  const scrollRafRef = useRef<number | null>(null);
 
   const abortActiveRequest = () => {
     requestSeqRef.current += 1;
@@ -148,6 +179,9 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
   useEffect(() => {
     return () => {
       abortActiveRequest();
+      if (scrollRafRef.current !== null) {
+        cancelAnimationFrame(scrollRafRef.current);
+      }
     };
   }, []);
 
@@ -166,15 +200,17 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
       })
       .catch(() => {
         if (active) {
-          setStatusInfo({
-            online: false,
-            provider: 'Google Gemini API (Free Tier)',
-            model: 'gemini-4-hydrogen',
-            fallbackModel: 'gemini-3.1-flash-lite',
-            freeTier: true,
-            reason: 'Online when available',
-            limits: { perMinute: 10, perDay: 60 }
-          });
+          setStatusInfo(prev =>
+            prev || {
+              online: false,
+              provider: 'Google Gemini API (Free Tier)',
+              model: 'gemini-4-hydrogen',
+              fallbackModel: 'gemini-3.1-flash-lite',
+              freeTier: true,
+              reason: 'Online when available',
+              limits: { perMinute: 10, perDay: 60 }
+            }
+          );
         }
       });
     return () => {
@@ -183,11 +219,28 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
     };
   }, [isOpen]);
 
+  const lastMessage = messages[messages.length - 1];
+  const isActivelyStreaming = Boolean(isSending && lastMessage?.role === 'model' && lastMessage?.isStreaming);
+
+  // Smooth on discrete user messages/open; instant direct scrollTop during high-frequency SSE chunks (zero Android jank)
   useEffect(() => {
-    if (isOpen) {
-      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (!isOpen) return;
+    const container = messagesScrollRef.current;
+    if (!container) return;
+
+    if (scrollRafRef.current !== null) {
+      cancelAnimationFrame(scrollRafRef.current);
     }
-  }, [messages, isSending, isOpen]);
+
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = null;
+      if (isActivelyStreaming) {
+        container.scrollTop = container.scrollHeight;
+      } else {
+        container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
+      }
+    });
+  }, [messages, isSending, isOpen, isActivelyStreaming]);
 
   const handleCopy = async (id: string, text: string) => {
     try {
@@ -199,6 +252,16 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
     } catch {
       // Clipboard blocked in strict iframe contexts
     }
+  };
+
+  const handleStopStreaming = () => {
+    abortActiveRequest();
+    setIsSending(false);
+    setMessages(prev =>
+      prev
+        .map(m => (m.isStreaming ? { ...m, isStreaming: false } : m))
+        .filter(m => m.role === 'user' || m.text.trim().length > 0)
+    );
   };
 
   const handleClearChat = () => {
@@ -231,9 +294,11 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
       timestamp: new Date().toISOString()
     };
 
+    const assistantId = `a_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+
     const historyForServer = messages
-      .filter(m => m.id !== 'skillflix_welcome' && !m.isError)
-      .slice(-10)
+      .filter(m => m.id !== 'skillflix_welcome' && !m.isError && m.text.trim().length > 0)
+      .slice(-6)
       .map(m => ({ role: m.role, text: m.text }));
 
     const seq = ++requestSeqRef.current;
@@ -241,34 +306,100 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
     activeControllerRef.current = controller;
     inFlightRef.current = true;
 
+    let streamModel = statusInfo?.model;
+    let receivedAnyChunk = false;
+
     setMessages(prev => [...prev, userMsg]);
     setInput('');
     setIsSending(true);
 
     try {
-      const response = await sendSkillFlixAiMessage({
+      const response = await streamSkillFlixAiMessage({
         message: cleanPrompt,
         history: historyForServer,
-        signal: controller.signal
+        signal: controller.signal,
+        onMeta: meta => {
+          if (requestSeqRef.current !== seq) return;
+          if (meta.model) streamModel = meta.model;
+          if (meta.quota) setQuota(meta.quota);
+        },
+        onChunk: (_delta, accumulated) => {
+          if (requestSeqRef.current !== seq) return;
+          if (!receivedAnyChunk) {
+            receivedAnyChunk = true;
+            setMessages(prev => [
+              ...prev,
+              {
+                id: assistantId,
+                role: 'model',
+                text: accumulated,
+                timestamp: new Date().toISOString(),
+                model: streamModel,
+                isStreaming: true
+              }
+            ]);
+          } else {
+            setMessages(prev =>
+              prev.map(m =>
+                m.id === assistantId
+                  ? { ...m, text: accumulated, model: streamModel || m.model, isStreaming: true }
+                  : m
+              )
+            );
+          }
+        }
       });
 
       if (requestSeqRef.current !== seq) return;
 
-      const assistantMsg: AiChatMessage = {
-        id: `a_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        role: 'model',
-        text: response.reply,
-        timestamp: new Date().toISOString(),
-        model: response.model,
-        referencedCourses: response.referencedCourses
-      };
+      setMessages(prev => {
+        const exists = prev.some(m => m.id === assistantId);
+        if (!exists) {
+          return [
+            ...prev,
+            {
+              id: assistantId,
+              role: 'model',
+              text: response.reply,
+              timestamp: new Date().toISOString(),
+              model: response.model,
+              referencedCourses: response.referencedCourses,
+              isStreaming: false
+            }
+          ];
+        }
+        return prev.map(m =>
+          m.id === assistantId
+            ? {
+                ...m,
+                text: response.reply,
+                model: response.model,
+                referencedCourses: response.referencedCourses,
+                isStreaming: false
+              }
+            : m
+        );
+      });
 
-      setMessages(prev => [...prev, assistantMsg]);
       setQuota(response.quota);
     } catch (err: any) {
       if (requestSeqRef.current !== seq) return;
       if (err instanceof AiClientError && err.code === 'AI_CANCELLED') {
+        setMessages(prev =>
+          prev
+            .map(m => (m.id === assistantId ? { ...m, isStreaming: false } : m))
+            .filter(m => m.id !== assistantId || m.text.trim().length > 0)
+        );
         return;
+      }
+
+      // Drop empty streaming shell if failure occurred after partial metadata or before body
+      if (!receivedAnyChunk) {
+        setMessages(prev => prev.filter(m => m.id !== assistantId));
+      } else {
+        setMessages(prev =>
+          prev.map(m => (m.id === assistantId ? { ...m, isStreaming: false } : m))
+        );
       }
 
       const code = err instanceof AiClientError ? err.code : 'AI_REQUEST_FAILED';
@@ -290,20 +421,27 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
 
   const handleFormSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSending) {
+      handleStopStreaming();
+      return;
+    }
     void submitPrompt(input);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      void submitPrompt(input);
+      if (!isSending) {
+        void submitPrompt(input);
+      }
     }
   };
 
   const showSuggestions = messages.length <= 1 && !isSending;
+  const showThinkingBubble = isSending && !isActivelyStreaming;
   const statusLabel = statusInfo
     ? statusInfo.online
-      ? 'Online • Free Tier'
+      ? 'Online • Fast Stream'
       : 'Online when available'
     : 'Online when available';
 
@@ -388,7 +526,10 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
           </div>
 
           {/* Messages Scroll Body */}
-          <div className="flex-1 overflow-y-auto px-3.5 py-3.5 space-y-3 overscroll-contain">
+          <div
+            ref={messagesScrollRef}
+            className="flex-1 overflow-y-auto px-3.5 py-3.5 space-y-3 overscroll-contain"
+          >
             {messages.map(msg => {
               const isUser = msg.role === 'user';
               return (
@@ -408,10 +549,10 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
                         {msg.text}
                       </p>
                     ) : (
-                      <FormattedAiText text={msg.text} />
+                      <FormattedAiText text={msg.text} isStreaming={msg.isStreaming} />
                     )}
 
-                    {!isUser && msg.id !== 'skillflix_welcome' && (
+                    {!isUser && msg.id !== 'skillflix_welcome' && !msg.isStreaming && (
                       <div className="mt-2 pt-1.5 border-t border-white/[0.06] flex items-center justify-between gap-2">
                         <span className="text-[10px] text-slate-400 truncate">
                           {msg.referencedCourses && msg.referencedCourses.length > 0
@@ -463,8 +604,8 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
               </div>
             )}
 
-            {/* Typing Indicator */}
-            {isSending && (
+            {/* Immediate Thinking Indicator (disappears as soon as first token streams) */}
+            {showThinkingBubble && (
               <div className="flex items-start">
                 <div className="px-3.5 py-2.5 rounded-2xl rounded-bl-sm bg-[#0F172A] border border-purple-500/25 flex items-center gap-1.5">
                   <span className="w-2 h-2 rounded-full bg-purple-400 animate-bounce [animation-delay:0ms]" />
@@ -517,8 +658,6 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
                 </div>
               </div>
             )}
-
-            <div ref={messagesEndRef} />
           </div>
 
           {/* Input Bar */}
@@ -540,14 +679,26 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
               }
               className="flex-1 resize-none max-h-24 px-3 py-2 rounded-xl bg-[#0C1222] border border-blue-500/25 focus:border-cyan-400 text-xs text-white placeholder-slate-500 outline-none leading-relaxed"
             />
-            <button
-              type="submit"
-              disabled={isSending || !input.trim()}
-              aria-label="Send message"
-              className="p-2.5 rounded-xl bg-gradient-to-r from-purple-600 via-blue-600 to-cyan-500 hover:from-purple-500 hover:to-cyan-400 disabled:opacity-40 text-white shadow-md shadow-blue-600/30 transition-all cursor-pointer shrink-0"
-            >
-              <Send className="w-4 h-4" />
-            </button>
+            {isSending ? (
+              <button
+                type="button"
+                onClick={handleStopStreaming}
+                aria-label="Stop response"
+                title="Stop generating"
+                className="p-2.5 rounded-xl bg-rose-600/90 hover:bg-rose-500 text-white shadow-md shadow-rose-600/30 transition-all cursor-pointer shrink-0"
+              >
+                <Square className="w-4 h-4 fill-current" />
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={!input.trim()}
+                aria-label="Send message"
+                className="p-2.5 rounded-xl bg-gradient-to-r from-purple-600 via-blue-600 to-cyan-500 hover:from-purple-500 hover:to-cyan-400 disabled:opacity-40 text-white shadow-md shadow-blue-600/30 transition-all cursor-pointer shrink-0"
+              >
+                <Send className="w-4 h-4" />
+              </button>
+            )}
           </form>
         </div>
       )}

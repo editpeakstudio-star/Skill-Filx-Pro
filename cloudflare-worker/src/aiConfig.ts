@@ -37,7 +37,29 @@ interface WorkerCacheEntry {
   synced: boolean;
 }
 
+interface WorkerResolvedCacheEntry {
+  expiresAt: number;
+  envSig: string;
+  value: WorkerResolvedAiConfig;
+}
+
 let vaultCache: WorkerCacheEntry | null = null;
+let resolvedCache: WorkerResolvedCacheEntry | null = null;
+
+function envSignature(env: WorkerEnv): string {
+  return [
+    env.FIREBASE_PROJECT_ID || '',
+    env.TELEGRAM_ENCRYPTION_KEY ? '1' : '0',
+    (env.GEMINI_API_KEY || '').slice(0, 8),
+    (env.OPENROUTER_API_KEY || '').slice(0, 8),
+    (env.GROQ_API_KEY || '').slice(0, 8),
+    env.AI_PROVIDER || '',
+    env.GEMINI_AI_MODEL || '',
+    env.GEMINI_FALLBACK_MODEL || '',
+    env.AI_RATE_LIMIT_PER_MIN || '',
+    env.AI_RATE_LIMIT_PER_DAY || ''
+  ].join('|');
+}
 
 function maskKey(raw: string): string {
   const clean = raw.trim();
@@ -65,7 +87,7 @@ async function fetchVaultDoc(
       return { doc: null, synced: false };
     }
     const doc = await getFirestoreDoc(env, fsToken, AI_CONFIG_COLLECTION, AI_CONFIG_DOC_ID);
-    vaultCache = { expiresAt: now + 10_000, doc, synced: true };
+    vaultCache = { expiresAt: now + 30_000, doc, synced: true };
     return { doc, synced: true };
   } catch {
     return { doc: vaultCache?.doc || null, synced: false };
@@ -77,6 +99,19 @@ export async function resolveWorkerAiConfig(
   callerToken?: string,
   bypassCache = false
 ): Promise<WorkerResolvedAiConfig> {
+  const now = Date.now();
+  const sig = envSignature(env);
+  if (
+    !callerToken &&
+    !bypassCache &&
+    resolvedCache &&
+    resolvedCache.expiresAt > now &&
+    resolvedCache.envSig === sig &&
+    resolvedCache.value.firestoreVaultSynced
+  ) {
+    return resolvedCache.value;
+  }
+
   const { doc, synced } = await fetchVaultDoc(env, callerToken, bypassCache);
 
   const envProvider = (env.AI_PROVIDER || 'gemini').trim().toLowerCase();
@@ -135,7 +170,7 @@ export async function resolveWorkerAiConfig(
       ? maskKey(envKey)
       : 'Not configured';
 
-  return {
+  const resolved: WorkerResolvedAiConfig = {
     AI_PROVIDER: provider,
     GEMINI_AI_MODEL: primaryModel,
     GEMINI_FALLBACK_MODEL: fallbackModel,
@@ -153,6 +188,11 @@ export async function resolveWorkerAiConfig(
     updatedAt: typeof doc?.updatedAt === 'string' ? doc.updatedAt : undefined,
     updatedByEmail: typeof doc?.updatedByEmail === 'string' ? doc.updatedByEmail : undefined
   };
+
+  if (synced && doc && !vaultDecryptError) {
+    resolvedCache = { expiresAt: now + 30_000, envSig: sig, value: resolved };
+  }
+  return resolved;
 }
 
 export async function getWorkerAdminAiConfigView(env: WorkerEnv, admin: VerifiedAdmin) {
@@ -270,5 +310,6 @@ export async function saveWorkerAdminAiConfig(
   });
 
   vaultCache = null;
+  resolvedCache = null;
   return getWorkerAdminAiConfigView(env, admin);
 }

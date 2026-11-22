@@ -572,7 +572,7 @@ export const AiConfigManager: React.FC<AiConfigManagerProps> = ({ currentUser })
                                 : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-white'
                             }`}
                           >
-                            {preset}
+                            {preset === 'gemini-3.1-flash-lite' ? `${preset} (Fastest)` : preset}
                           </button>
                         ))}
                       </div>
@@ -622,7 +622,7 @@ export const AiConfigManager: React.FC<AiConfigManagerProps> = ({ currentUser })
                                 : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-white'
                             }`}
                           >
-                            {preset}
+                            {preset === 'gemini-3.1-flash-lite' ? `${preset} (Fastest)` : preset}
                           </button>
                         ))}
                       </div>

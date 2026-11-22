@@ -28,7 +28,12 @@ import {
   testBotConnection,
   toPublicBot
 } from './telegram';
-import { getWorkerAiStatus, handleWorkerAiChat, testWorkerAiConnection } from './ai';
+import {
+  getWorkerAiStatus,
+  handleWorkerAiChat,
+  handleWorkerAiChatStream,
+  testWorkerAiConnection
+} from './ai';
 import { getWorkerAdminAiConfigView, saveWorkerAdminAiConfig } from './aiConfig';
 import {
   HttpError,
@@ -654,10 +659,34 @@ async function handleRequest(request: Request, env: WorkerEnv): Promise<Response
     return jsonResponse(request, env, await getWorkerAiStatus(env));
   }
 
-  // POST /api/ai/chat
-  if (pathname === '/api/ai/chat' && method === 'POST') {
+  // POST /api/ai/chat/stream (Server-Sent Events streaming)
+  if (pathname === '/api/ai/chat/stream' && method === 'POST') {
     const body = await readJsonBody<{ message?: unknown; history?: unknown }>(request);
-    const result = await handleWorkerAiChat(authHeader, env, body);
+    return handleWorkerAiChatStream(
+      authHeader,
+      env,
+      body,
+      buildCorsHeaders(request, env),
+      request.signal
+    );
+  }
+
+  // POST /api/ai/chat (JSON by default, or SSE if body.stream === true / Accept includes text/event-stream)
+  if (pathname === '/api/ai/chat' && method === 'POST') {
+    const body = await readJsonBody<{ message?: unknown; history?: unknown; stream?: unknown }>(request);
+    const wantsStream =
+      body.stream === true ||
+      (request.headers.get('Accept') || '').toLowerCase().includes('text/event-stream');
+    if (wantsStream) {
+      return handleWorkerAiChatStream(
+        authHeader,
+        env,
+        body,
+        buildCorsHeaders(request, env),
+        request.signal
+      );
+    }
+    const result = await handleWorkerAiChat(authHeader, env, body, request.signal);
     return jsonResponse(request, env, result);
   }
 

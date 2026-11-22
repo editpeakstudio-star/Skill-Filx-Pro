@@ -41,6 +41,7 @@ import {
   AiServiceError,
   getAsyncAiStatus,
   handleSkillFlixAiChat,
+  handleSkillFlixAiChatStream,
   testAiConfigurationConnection,
   type AiChatRequestBody
 } from './server/skillFlixAi.ts';
@@ -789,7 +790,28 @@ export function createApp() {
     res.json(status);
   });
 
-  app.post('/api/ai/chat', async (req: Request, res: Response) => {
+  const handleExpressAiError = (res: Response, err: any) => {
+    if (err instanceof AiServiceError) {
+      res.status(err.status).json({
+        code: err.code,
+        error: err.message,
+        quota: err.quota
+      });
+      return;
+    }
+    const message = sanitizeErrorMessage((err as Error)?.message || 'Authentication failed.');
+    const lower = message.toLowerCase();
+    const status =
+      lower.includes('expired') || lower.includes('token') || lower.includes('authentication')
+        ? 401
+        : 500;
+    res.status(status).json({
+      code: status === 401 ? 'INVALID_AUTH_TOKEN' : 'AI_INTERNAL_ERROR',
+      error: message
+    });
+  };
+
+  const runExpressAiStream = async (req: Request, res: Response) => {
     const idToken = extractBearerToken(req.headers.authorization);
     if (!idToken) {
       res.status(401).json({
@@ -799,30 +821,93 @@ export function createApp() {
       return;
     }
 
+    const abortController = new AbortController();
+    const onResClose = () => {
+      if (!res.writableEnded) {
+        abortController.abort();
+      }
+    };
+    res.on('close', onResClose);
+
     try {
       const caller = await verifyFirebaseIdToken(idToken);
       const body = (req.body || {}) as AiChatRequestBody;
-      const outcome = await handleSkillFlixAiChat(caller, body);
+
+      await handleSkillFlixAiChatStream(
+        caller,
+        body,
+        {
+          onHeadersReady: () => {
+            if (res.headersSent) return;
+            res.status(200);
+            res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+            res.setHeader('Cache-Control', 'no-cache, no-store, no-transform');
+            res.setHeader('Connection', 'keep-alive');
+            res.setHeader('X-Accel-Buffering', 'no');
+            res.flushHeaders?.();
+          },
+          sendEvent: (event, data) => {
+            if (res.writableEnded || abortController.signal.aborted) return;
+            res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+          }
+        },
+        abortController.signal
+      );
+
+      if (!res.writableEnded) {
+        res.end();
+      }
+    } catch (err: any) {
+      if (!res.headersSent) {
+        handleExpressAiError(res, err);
+      } else if (!res.writableEnded) {
+        const message = sanitizeErrorMessage((err as Error)?.message || 'Skill-Flix AI stream failed.');
+        res.write(
+          `event: error\ndata: ${JSON.stringify({ status: 502, code: 'AI_STREAM_ERROR', error: message })}\n\n`
+        );
+        res.end();
+      }
+    } finally {
+      res.off('close', onResClose);
+    }
+  };
+
+  app.post('/api/ai/chat/stream', runExpressAiStream);
+
+  app.post('/api/ai/chat', async (req: Request, res: Response) => {
+    const wantsStream =
+      Boolean((req.body as { stream?: unknown } | undefined)?.stream === true) ||
+      String(req.headers.accept || '').toLowerCase().includes('text/event-stream');
+
+    if (wantsStream) {
+      await runExpressAiStream(req, res);
+      return;
+    }
+
+    const idToken = extractBearerToken(req.headers.authorization);
+    if (!idToken) {
+      res.status(401).json({
+        code: 'AUTH_REQUIRED',
+        error: 'Please sign in to your Skill-Flix account to chat with Skill-Flix AI.'
+      });
+      return;
+    }
+
+    const abortController = new AbortController();
+    const onResClose = () => {
+      if (!res.writableEnded) abortController.abort();
+    };
+    res.on('close', onResClose);
+
+    try {
+      const caller = await verifyFirebaseIdToken(idToken);
+      const body = (req.body || {}) as AiChatRequestBody;
+      const outcome = await handleSkillFlixAiChat(caller, body, abortController.signal);
       res.json(outcome);
     } catch (err: any) {
-      if (err instanceof AiServiceError) {
-        res.status(err.status).json({
-          code: err.code,
-          error: err.message,
-          quota: err.quota
-        });
-        return;
-      }
-      const message = sanitizeErrorMessage((err as Error)?.message || 'Authentication failed.');
-      const lower = message.toLowerCase();
-      const status =
-        lower.includes('expired') || lower.includes('token') || lower.includes('authentication')
-          ? 401
-          : 500;
-      res.status(status).json({
-        code: status === 401 ? 'INVALID_AUTH_TOKEN' : 'AI_INTERNAL_ERROR',
-        error: message
-      });
+      handleExpressAiError(res, err);
+    } finally {
+      res.off('close', onResClose);
     }
   });
 

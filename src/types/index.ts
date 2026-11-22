@@ -346,6 +346,7 @@ export interface AiChatMessage {
   model?: string;
   referencedCourses?: string[];
   isError?: boolean;
+  isStreaming?: boolean;
 }
 
 export interface AiQuotaInfo {

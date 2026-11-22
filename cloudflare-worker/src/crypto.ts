@@ -19,6 +19,8 @@ function fromHex(hex: string): Uint8Array<ArrayBuffer> {
   return out;
 }
 
+const aesKeyCache = new Map<string, Promise<CryptoKey>>();
+
 async function importAesKey(secret?: string): Promise<CryptoKey> {
   const trimmed = (secret || '').trim();
   if (!trimmed) {
@@ -28,21 +30,31 @@ async function importAesKey(secret?: string): Promise<CryptoKey> {
     );
   }
 
-  let keyBytes: Uint8Array<ArrayBuffer>;
-  if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
-    keyBytes = fromHex(trimmed);
-  } else {
-    const hash = await crypto.subtle.digest('SHA-256', encoder.encode(trimmed));
-    keyBytes = new Uint8Array(hash);
-  }
+  const cached = aesKeyCache.get(trimmed);
+  if (cached) return cached;
 
-  return crypto.subtle.importKey(
-    'raw',
-    keyBytes,
-    { name: 'AES-GCM' },
-    false,
-    ['encrypt', 'decrypt']
-  );
+  const keyPromise = (async () => {
+    let keyBytes: Uint8Array<ArrayBuffer>;
+    if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+      keyBytes = fromHex(trimmed);
+    } else {
+      const hash = await crypto.subtle.digest('SHA-256', encoder.encode(trimmed));
+      keyBytes = new Uint8Array(hash);
+    }
+
+    return crypto.subtle.importKey(
+      'raw',
+      keyBytes,
+      { name: 'AES-GCM' },
+      false,
+      ['encrypt', 'decrypt']
+    );
+  })();
+
+  if (aesKeyCache.size > 8) aesKeyCache.clear();
+  aesKeyCache.set(trimmed, keyPromise);
+  keyPromise.catch(() => aesKeyCache.delete(trimmed));
+  return keyPromise;
 }
 
 export async function encryptBotToken(plainToken: string, secret?: string): Promise<string> {

@@ -5,13 +5,28 @@ import type {
   AiConnectionTestResult
 } from '../types';
 
-const AI_CONFIG_API_BASE = (
-  import.meta.env.VITE_AI_API_URL ||
-  import.meta.env.VITE_TELEGRAM_API_URL ||
-  ''
-)
-  .trim()
-  .replace(/\/+$/, '');
+const PRODUCTION_WORKER_URL = 'https://skill-flix-telegram-api.editpeakstudio.workers.dev';
+
+function resolveAiConfigApiBase(): string {
+  const configured = (
+    import.meta.env.VITE_AI_API_URL ||
+    import.meta.env.VITE_TELEGRAM_API_URL ||
+    ''
+  )
+    .trim()
+    .replace(/\/+$/, '');
+  if (configured) return configured;
+
+  if (typeof window !== 'undefined') {
+    const host = window.location.hostname.toLowerCase();
+    if (host === 'skillflix-academy.web.app' || host === 'skillflix-academy.firebaseapp.com') {
+      return PRODUCTION_WORKER_URL;
+    }
+  }
+  return '';
+}
+
+const AI_CONFIG_API_BASE = resolveAiConfigApiBase();
 
 function resolveUrl(path: string): string {
   const clean = path.startsWith('/') ? path : `/${path}`;

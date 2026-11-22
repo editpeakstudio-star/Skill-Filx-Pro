@@ -196,6 +196,8 @@ async function fetchWithTimeout(
   }
 }
 
+const importedJwkKeys = new Map<string, CryptoKey>();
+
 async function fetchGoogleJwks(forceRefresh = false): Promise<Array<JsonWebKey & { kid?: string }>> {
   const now = Date.now();
   if (!forceRefresh && jwkCache && jwkCache.expiresAt > now) {
@@ -213,6 +215,7 @@ async function fetchGoogleJwks(forceRefresh = false): Promise<Array<JsonWebKey &
   const maxAgeMatch = cc.match(/max-age=(\d+)/i);
   const maxAge = maxAgeMatch ? Number(maxAgeMatch[1]) : 3600;
 
+  importedJwkKeys.clear();
   jwkCache = {
     keys,
     expiresAt: now + Math.max(60, maxAge) * 1000
@@ -265,23 +268,27 @@ export async function verifyFirebaseIdToken(
     throw new HttpError(401, 'Unsupported Firebase token algorithm.');
   }
 
-  let keys = await fetchGoogleJwks(false);
-  let jwk = keys.find(k => k.kid === header.kid);
-  if (!jwk) {
-    keys = await fetchGoogleJwks(true);
-    jwk = keys.find(k => k.kid === header.kid);
-  }
-  if (!jwk) {
-    throw new HttpError(401, 'Firebase signing key was not found.');
-  }
+  let cryptoKey = importedJwkKeys.get(header.kid);
+  if (!cryptoKey) {
+    let keys = await fetchGoogleJwks(false);
+    let jwk = keys.find(k => k.kid === header.kid);
+    if (!jwk) {
+      keys = await fetchGoogleJwks(true);
+      jwk = keys.find(k => k.kid === header.kid);
+    }
+    if (!jwk) {
+      throw new HttpError(401, 'Firebase signing key was not found.');
+    }
 
-  const cryptoKey = await crypto.subtle.importKey(
-    'jwk',
-    jwk,
-    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    false,
-    ['verify']
-  );
+    cryptoKey = await crypto.subtle.importKey(
+      'jwk',
+      jwk,
+      { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+      false,
+      ['verify']
+    );
+    importedJwkKeys.set(header.kid, cryptoKey);
+  }
 
   const signatureValid = await crypto.subtle.verify(
     'RSASSA-PKCS1-v1_5',
