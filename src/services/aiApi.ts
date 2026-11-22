@@ -1,33 +1,11 @@
 import { getAuth, onAuthStateChanged, type User } from 'firebase/auth';
 import type { AiChatResponse, AiQuotaInfo, AiStatusResponse } from '../types';
-
-const PRODUCTION_WORKER_URL = 'https://skill-flix-telegram-api.editpeakstudio.workers.dev';
-
-function resolveAiApiBase(): string {
-  const configured = (
-    import.meta.env.VITE_AI_API_URL ||
-    import.meta.env.VITE_TELEGRAM_API_URL ||
-    ''
-  )
-    .trim()
-    .replace(/\/+$/, '');
-  if (configured) return configured;
-
-  if (typeof window !== 'undefined') {
-    const host = window.location.hostname.toLowerCase();
-    if (host === 'skillflix-academy.web.app' || host === 'skillflix-academy.firebaseapp.com') {
-      return PRODUCTION_WORKER_URL;
-    }
-  }
-  return '';
-}
-
-const AI_API_BASE = resolveAiApiBase();
-
-function resolveAiUrl(path: string): string {
-  const normalized = path.startsWith('/') ? path : `/${path}`;
-  return AI_API_BASE ? `${AI_API_BASE}${normalized}` : normalized;
-}
+import {
+  getApiBaseCandidates,
+  looksLikeHtmlPayload,
+  resolveCandidateUrl,
+  sleepMs
+} from './apiBaseResolver';
 
 const STATUS_CACHE_TTL_MS = 45_000;
 let cachedStatus: { value: AiStatusResponse; expiresAt: number } | null = null;
@@ -197,37 +175,72 @@ export async function fetchSkillFlixAiStatus(
   }
 
   const run = (async () => {
-    const res = await fetchAiWithTimeout(
-      resolveAiUrl('/api/ai/status'),
-      {
-        method: 'GET',
-        headers: { Accept: 'application/json' }
-      },
-      10_000,
-      signal
-    );
+    const candidates = getApiBaseCandidates(true);
+    let lastError: AiClientError | null = null;
 
-    const contentType = (res.headers.get('content-type') || '').toLowerCase();
-    const rawText = await res.text().catch(() => '');
+    for (let cIdx = 0; cIdx < candidates.length; cIdx++) {
+      const base = candidates[cIdx];
+      const url = resolveCandidateUrl(base, '/api/ai/status');
+      const hasMoreCandidates = cIdx < candidates.length - 1;
 
-    if (!contentType.includes('application/json')) {
-      throw new AiClientError(503, 'AI_BACKEND_UNREACHABLE', 'Skill-Flix AI service is unavailable.');
+      for (let attempt = 0; attempt < 2; attempt++) {
+        let res: Response;
+        try {
+          res = await fetchAiWithTimeout(
+            url,
+            {
+              method: 'GET',
+              headers: { Accept: 'application/json' }
+            },
+            10_000,
+            signal
+          );
+        } catch (err: any) {
+          if (err instanceof AiClientError && err.code === 'AI_CANCELLED') throw err;
+          lastError = err instanceof AiClientError
+            ? err
+            : new AiClientError(503, 'NETWORK_ERROR', 'Could not reach Skill-Flix AI.');
+          if (attempt === 0) {
+            await sleepMs(250, signal);
+            continue;
+          }
+          break;
+        }
+
+        const contentType = (res.headers.get('content-type') || '').toLowerCase();
+        const rawText = await res.text().catch(() => '');
+
+        if (!contentType.includes('application/json')) {
+          if (looksLikeHtmlPayload(contentType, rawText) && hasMoreCandidates) {
+            break;
+          }
+          lastError = new AiClientError(503, 'AI_BACKEND_UNREACHABLE', 'Skill-Flix AI service is unavailable.');
+          if (hasMoreCandidates) break;
+          throw lastError;
+        }
+
+        let data: Partial<AiStatusResponse> & { error?: string; code?: string };
+        try {
+          data = rawText ? (JSON.parse(rawText) as Partial<AiStatusResponse> & { error?: string; code?: string }) : {};
+        } catch {
+          throw new AiClientError(res.status || 502, 'INVALID_SERVER_RESPONSE', 'Skill-Flix AI returned invalid JSON.');
+        }
+
+        if (res.status === 404 && data.code === 'ENDPOINT_NOT_FOUND' && hasMoreCandidates) {
+          break;
+        }
+
+        if (!res.ok) {
+          throw new AiClientError(res.status, 'AI_STATUS_ERROR', data.error || 'Could not reach Skill-Flix AI.');
+        }
+
+        const result = data as AiStatusResponse;
+        cachedStatus = { value: result, expiresAt: Date.now() + STATUS_CACHE_TTL_MS };
+        return result;
+      }
     }
 
-    let data: Partial<AiStatusResponse> & { error?: string };
-    try {
-      data = rawText ? (JSON.parse(rawText) as Partial<AiStatusResponse> & { error?: string }) : {};
-    } catch {
-      throw new AiClientError(res.status || 502, 'INVALID_SERVER_RESPONSE', 'Skill-Flix AI returned invalid JSON.');
-    }
-
-    if (!res.ok) {
-      throw new AiClientError(res.status, 'AI_STATUS_ERROR', data.error || 'Could not reach Skill-Flix AI.');
-    }
-
-    const result = data as AiStatusResponse;
-    cachedStatus = { value: result, expiresAt: Date.now() + STATUS_CACHE_TTL_MS };
-    return result;
+    throw lastError || new AiClientError(503, 'AI_BACKEND_UNREACHABLE', 'Skill-Flix AI service is unavailable.');
   })();
 
   inFlightStatusPromise = run;
@@ -264,65 +277,99 @@ export async function sendSkillFlixAiMessage(params: {
   signal?: AbortSignal;
 }): Promise<AiChatResponse> {
   const idToken = await getAuthorizedIdToken();
+  const candidates = getApiBaseCandidates(true);
+  let lastError: AiClientError | null = null;
 
-  const res = await fetchAiWithTimeout(
-    resolveAiUrl('/api/ai/chat'),
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${idToken}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json'
-      },
-      body: JSON.stringify({
-        message: params.message,
-        history: params.history
-      })
-    },
-    35_000,
-    params.signal
+  for (let cIdx = 0; cIdx < candidates.length; cIdx++) {
+    const base = candidates[cIdx];
+    const url = resolveCandidateUrl(base, '/api/ai/chat');
+    const hasMoreCandidates = cIdx < candidates.length - 1;
+
+    let res: Response;
+    try {
+      res = await fetchAiWithTimeout(
+        url,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${idToken}`,
+            'Content-Type': 'application/json',
+            Accept: 'application/json'
+          },
+          body: JSON.stringify({
+            message: params.message,
+            history: params.history
+          })
+        },
+        35_000,
+        params.signal
+      );
+    } catch (err: any) {
+      if (err instanceof AiClientError && err.code === 'AI_CANCELLED') throw err;
+      lastError = err instanceof AiClientError
+        ? err
+        : new AiClientError(503, 'NETWORK_ERROR', 'Network connection interrupted while contacting Skill-Flix AI.');
+      if (hasMoreCandidates) continue;
+      throw lastError;
+    }
+
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    const rawText = await res.text().catch(() => '');
+
+    if (!contentType.includes('application/json')) {
+      if (looksLikeHtmlPayload(contentType, rawText) && hasMoreCandidates) {
+        continue;
+      }
+      const fallback = defaultErrorByStatus(res.status || 502);
+      throw new AiClientError(
+        res.status || 502,
+        res.status === 504 ? 'AI_TIMEOUT' : 'INVALID_SERVER_RESPONSE',
+        res.status >= 500 ? fallback.message : 'Skill-Flix AI server returned an unexpected response.'
+      );
+    }
+
+    let payload: Partial<AiChatResponse> & {
+      error?: string;
+      code?: string;
+    };
+    try {
+      const parsed = rawText ? JSON.parse(rawText) : {};
+      payload =
+        parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+          ? (parsed as Partial<AiChatResponse> & { error?: string; code?: string })
+          : {};
+    } catch {
+      throw new AiClientError(
+        res.status || 502,
+        'INVALID_SERVER_RESPONSE',
+        'Skill-Flix AI server returned a malformed response. Please try again.'
+      );
+    }
+
+    if (res.status === 404 && payload.code === 'ENDPOINT_NOT_FOUND' && hasMoreCandidates) {
+      continue;
+    }
+
+    if (!res.ok || !payload.reply) {
+      const fallback = defaultErrorByStatus(res.status || 500);
+      throw new AiClientError(
+        res.status || 500,
+        payload.code || fallback.code,
+        payload.error || fallback.message
+      );
+    }
+
+    return payload as AiChatResponse;
+  }
+
+  throw (
+    lastError ||
+    new AiClientError(
+      503,
+      'NETWORK_ERROR',
+      'Network connection interrupted while contacting Skill-Flix AI. Please try again.'
+    )
   );
-
-  const contentType = (res.headers.get('content-type') || '').toLowerCase();
-  const rawText = await res.text().catch(() => '');
-
-  if (!contentType.includes('application/json')) {
-    const fallback = defaultErrorByStatus(res.status || 502);
-    throw new AiClientError(
-      res.status || 502,
-      res.status === 504 ? 'AI_TIMEOUT' : 'INVALID_SERVER_RESPONSE',
-      res.status >= 500 ? fallback.message : 'Skill-Flix AI server returned an unexpected response.'
-    );
-  }
-
-  let payload: Partial<AiChatResponse> & {
-    error?: string;
-    code?: string;
-  };
-  try {
-    const parsed = rawText ? JSON.parse(rawText) : {};
-    payload =
-      parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-        ? (parsed as Partial<AiChatResponse> & { error?: string; code?: string })
-        : {};
-  } catch {
-    throw new AiClientError(
-      res.status || 502,
-      'INVALID_SERVER_RESPONSE',
-      'Skill-Flix AI server returned a malformed response. Please try again.'
-    );
-  }
-
-  if (!res.ok || !payload.reply) {
-    const fallback = defaultErrorByStatus(res.status || 500);
-    throw new AiClientError(
-      res.status || 500,
-      payload.code || fallback.code,
-      payload.error || fallback.message
-    );
-  }
-
-  return payload as AiChatResponse;
 }
 
 export async function streamSkillFlixAiMessage(params: {
@@ -362,20 +409,63 @@ export async function streamSkillFlixAiMessage(params: {
   resetInactivityTimer();
 
   try {
-    const res = await fetch(resolveAiUrl('/api/ai/chat/stream'), {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${idToken}`,
-        'Content-Type': 'application/json',
-        Accept: 'text/event-stream, application/json'
-      },
-      body: JSON.stringify({
-        message: params.message,
-        history: params.history,
-        stream: true
-      }),
-      signal: streamController.signal
-    });
+    const candidates = getApiBaseCandidates(true);
+    let res: Response | null = null;
+    let lastConnectErr: unknown = null;
+
+    for (let cIdx = 0; cIdx < candidates.length; cIdx++) {
+      const base = candidates[cIdx];
+      const streamUrl = resolveCandidateUrl(base, '/api/ai/chat/stream');
+      const hasMoreCandidates = cIdx < candidates.length - 1;
+
+      try {
+        const candidateRes = await fetch(streamUrl, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${idToken}`,
+            'Content-Type': 'application/json',
+            Accept: 'text/event-stream, application/json'
+          },
+          body: JSON.stringify({
+            message: params.message,
+            history: params.history,
+            stream: true
+          }),
+          signal: streamController.signal
+        });
+
+        const ct = (candidateRes.headers.get('content-type') || '').toLowerCase();
+        if (!ct.includes('text/event-stream') && !ct.includes('application/json')) {
+          const probeText = await candidateRes.text().catch(() => '');
+          if (looksLikeHtmlPayload(ct, probeText) && hasMoreCandidates) {
+            continue;
+          }
+          const fallback = defaultErrorByStatus(candidateRes.status || 502);
+          throw new AiClientError(
+            candidateRes.status || 502,
+            candidateRes.status === 504 ? 'AI_TIMEOUT' : 'INVALID_SERVER_RESPONSE',
+            candidateRes.status >= 500 ? fallback.message : 'Skill-Flix AI server returned an unexpected response.'
+          );
+        }
+
+        res = candidateRes;
+        break;
+      } catch (err: any) {
+        if (err instanceof AiClientError) throw err;
+        if ((params.signal?.aborted && !timedOut) || timedOut || err?.name === 'AbortError') {
+          throw err;
+        }
+        lastConnectErr = err;
+        if (hasMoreCandidates) {
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    if (!res) {
+      throw lastConnectErr || new Error('Unable to reach Skill-Flix AI streaming endpoint.');
+    }
 
     const contentType = (res.headers.get('content-type') || '').toLowerCase();
 

@@ -60,10 +60,13 @@ function resolveAllowedOrigin(request: Request, env: WorkerEnv): string | null {
     return origin;
   }
 
-  // Allow Firebase Hosting preview channels for this project and AI Studio Cloud Run previews
+  // Allow Firebase Hosting preview channels, localhost dev servers, and AI Studio / Cloud Run previews
   if (
+    /^http:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?$/i.test(origin) ||
     /^https:\/\/skillflix-academy(?:--[a-z0-9-]+)?\.(?:web\.app|firebaseapp\.com)$/i.test(origin) ||
-    /^https:\/\/[a-z0-9-]+\.(?:[a-z0-9-]+\.)?run\.app$/i.test(origin)
+    /^https:\/\/(?:[a-z0-9-]+\.)+(?:run\.app|googleusercontent\.com|usercontent\.goog|aistudio\.google\.com|cloudshell\.dev|idx\.google\.com)$/i.test(
+      origin
+    )
   ) {
     return origin;
   }

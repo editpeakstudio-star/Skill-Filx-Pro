@@ -6,6 +6,12 @@ import type {
   TelegramNotificationJob,
   TelegramNotificationLog
 } from '../types';
+import {
+  getApiBaseCandidates,
+  looksLikeHtmlPayload,
+  resolveCandidateUrl,
+  sleepMs
+} from './apiBaseResolver';
 
 async function waitForSignedInUser(timeoutMs = 3000): Promise<User> {
   const auth = getAuth();
@@ -46,98 +52,121 @@ async function waitForSignedInUser(timeoutMs = 3000): Promise<User> {
   });
 }
 
-async function getBearerToken(): Promise<string> {
-  const user = await waitForSignedInUser();
-  return user.getIdToken();
-}
-
-const PRODUCTION_WORKER_URL = 'https://skill-flix-telegram-api.editpeakstudio.workers.dev';
-
-function resolveTelegramApiBase(): string {
-  const configured = (import.meta.env.VITE_TELEGRAM_API_URL || '').trim().replace(/\/+$/, '');
-  if (configured) return configured;
-
-  if (typeof window !== 'undefined') {
-    const host = window.location.hostname.toLowerCase();
-    if (host === 'skillflix-academy.web.app' || host === 'skillflix-academy.firebaseapp.com') {
-      return PRODUCTION_WORKER_URL;
-    }
-  }
-  return '';
-}
-
-const TELEGRAM_API_BASE = resolveTelegramApiBase();
-
-function resolveTelegramUrl(path: string): string {
-  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
-  return TELEGRAM_API_BASE ? `${TELEGRAM_API_BASE}${normalizedPath}` : normalizedPath;
-}
-
 async function apiRequest<T>(
   path: string,
   options: { method?: string; body?: unknown } = {}
 ): Promise<T> {
-  const token = await getBearerToken();
-  const targetUrl = resolveTelegramUrl(path);
+  const user = await waitForSignedInUser();
+  let token = await user.getIdToken();
+  const candidates = getApiBaseCandidates(false);
 
-  let res: Response;
-  try {
-    res = await fetch(targetUrl, {
-      method: options.method || 'GET',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        ...(options.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
-        Accept: 'application/json'
-      },
-      body: options.body !== undefined ? JSON.stringify(options.body) : undefined
-    });
-  } catch {
+  let lastError: Error | null = null;
+  let sawHtmlFallback = false;
+
+  for (let cIdx = 0; cIdx < candidates.length; cIdx++) {
+    const base = candidates[cIdx];
+    const targetUrl = resolveCandidateUrl(base, path);
+    const hasMoreCandidates = cIdx < candidates.length - 1;
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let res: Response;
+      try {
+        res = await fetch(targetUrl, {
+          method: options.method || 'GET',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            ...(options.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+            Accept: 'application/json'
+          },
+          body: options.body !== undefined ? JSON.stringify(options.body) : undefined
+        });
+      } catch (err: any) {
+        lastError = new Error(
+          `Network error reaching Telegram Bot Manager API${err?.message ? ` (${err.message})` : ''}.`
+        );
+        if (attempt === 0) {
+          await sleepMs(350);
+          continue;
+        }
+        break;
+      }
+
+      if (res.status === 401 && attempt === 0) {
+        try {
+          token = await user.getIdToken(true);
+          continue;
+        } catch {
+          // Fall through
+        }
+      }
+
+      const contentType = (res.headers.get('content-type') || '').toLowerCase();
+      const rawText = await res.text().catch(() => '');
+
+      if (!contentType.includes('application/json')) {
+        if (looksLikeHtmlPayload(contentType, rawText)) {
+          sawHtmlFallback = true;
+          if (hasMoreCandidates) {
+            break;
+          }
+          throw new Error(
+            'Telegram API backend is not connected on this host (received HTML instead of JSON). Deploy the Cloudflare Worker in cloudflare-worker/ and set VITE_TELEGRAM_API_URL in .env.production before building.'
+          );
+        }
+
+        if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt === 0) {
+          await sleepMs(350);
+          continue;
+        }
+        if (hasMoreCandidates && (res.status === 404 || res.status >= 502)) {
+          lastError = new Error(`Telegram API request failed (${res.status}).`);
+          break;
+        }
+        if (!res.ok) {
+          throw new Error(`Telegram API request failed (${res.status}).`);
+        }
+        throw new Error('Telegram API returned an unexpected non-JSON response.');
+      }
+
+      let data: Record<string, unknown>;
+      try {
+        const parsed = rawText ? JSON.parse(rawText) : {};
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          throw new Error('Invalid JSON object');
+        }
+        data = parsed as Record<string, unknown>;
+      } catch {
+        throw new Error(`Telegram API returned malformed JSON (HTTP ${res.status}).`);
+      }
+
+      if (res.status === 404 && data.code === 'ENDPOINT_NOT_FOUND' && hasMoreCandidates) {
+        break;
+      }
+
+      if (!res.ok) {
+        const errMsg =
+          (typeof data.error === 'string' && data.error) ||
+          (typeof data.message === 'string' && data.message) ||
+          `Request failed (${res.status})`;
+        throw new Error(errMsg);
+      }
+
+      return data as unknown as T;
+    }
+  }
+
+  if (sawHtmlFallback && !lastError) {
     throw new Error(
-      'Network error reaching Telegram Bot Manager API. Check your connection and VITE_TELEGRAM_API_URL configuration.'
+      'Telegram API backend is not connected on this host (received HTML instead of JSON). Deploy the Cloudflare Worker in cloudflare-worker/ and set VITE_TELEGRAM_API_URL in .env.production before building.'
     );
   }
 
-  const contentType = (res.headers.get('content-type') || '').toLowerCase();
-  const rawText = await res.text().catch(() => '');
-
-  if (!contentType.includes('application/json')) {
-    const looksLikeHtml =
-      contentType.includes('text/html') ||
-      rawText.trimStart().toLowerCase().startsWith('<!doctype') ||
-      rawText.trimStart().toLowerCase().startsWith('<html');
-
-    if (looksLikeHtml) {
-      throw new Error(
-        'Telegram API backend is not connected on this host (received HTML instead of JSON). Deploy the Cloudflare Worker in cloudflare-worker/ and set VITE_TELEGRAM_API_URL in .env.production before building.'
-      );
-    }
-
-    if (!res.ok) {
-      throw new Error(`Telegram API request failed (${res.status}).`);
-    }
-    throw new Error('Telegram API returned an unexpected non-JSON response.');
-  }
-
-  let data: Record<string, unknown>;
-  try {
-    const parsed = rawText ? JSON.parse(rawText) : {};
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new Error('Invalid JSON object');
-    }
-    data = parsed as Record<string, unknown>;
-  } catch {
-    throw new Error(`Telegram API returned malformed JSON (HTTP ${res.status}).`);
-  }
-
-  if (!res.ok) {
-    const errMsg =
-      (typeof data.error === 'string' && data.error) ||
-      (typeof data.message === 'string' && data.message) ||
-      `Request failed (${res.status})`;
-    throw new Error(errMsg);
-  }
-
-  return data as unknown as T;
+  throw (
+    lastError ||
+    new Error(
+      'Network error reaching Telegram Bot Manager API. Check your connection and VITE_TELEGRAM_API_URL configuration.'
+    )
+  );
 }
 
 function normalizeDashboardResponse(raw: Partial<TelegramDashboardResponse>): TelegramDashboardResponse {

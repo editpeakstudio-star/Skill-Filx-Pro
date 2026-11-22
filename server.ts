@@ -121,9 +121,53 @@ async function requireSuperAdminContext(req: Request, res: Response) {
   }
 }
 
+function resolveAllowedExpressOrigin(originHeader: string | undefined): string | null {
+  const origin = (originHeader || '').trim();
+  if (!origin) return null;
+
+  const configured = (
+    process.env.ALLOWED_ORIGINS ||
+    'https://skillflix-academy.web.app,https://skillflix-academy.firebaseapp.com,http://localhost:3000,http://127.0.0.1:3000'
+  )
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  if (configured.includes('*') || configured.includes(origin)) {
+    return origin;
+  }
+
+  if (
+    /^http:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?$/i.test(origin) ||
+    /^https:\/\/skillflix-academy(?:--[a-z0-9-]+)?\.(?:web\.app|firebaseapp\.com)$/i.test(origin) ||
+    /^https:\/\/(?:[a-z0-9-]+\.)+(?:run\.app|googleusercontent\.com|usercontent\.goog|aistudio\.google\.com|cloudshell\.dev|idx\.google\.com)$/i.test(origin)
+  ) {
+    return origin;
+  }
+
+  return null;
+}
+
 export function createApp() {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
+
+  app.use('/api', (req, res, next) => {
+    const allowedOrigin = resolveAllowedExpressOrigin(req.headers.origin);
+    if (allowedOrigin) {
+      res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+      res.setHeader('Vary', 'Origin');
+    }
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, Accept');
+    res.setHeader('Access-Control-Max-Age', '86400');
+
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
 
   // ======================================================
   // HEALTH CHECK

@@ -360,9 +360,20 @@ export const AiConfigManager: React.FC<AiConfigManagerProps> = ({ currentUser })
       {loadError && (
         <div className="p-4 rounded-2xl bg-rose-950/30 border border-rose-500/35 flex items-start gap-3 text-xs text-rose-200">
           <XCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-          <div className="space-y-1 flex-1">
-            <p className="font-bold text-white">Unable to load AI Configuration</p>
-            <p className="leading-relaxed">{loadError}</p>
+          <div className="space-y-2.5 flex-1 min-w-0">
+            <div className="space-y-1">
+              <p className="font-bold text-white">Unable to load AI Configuration</p>
+              <p className="leading-relaxed break-words">{loadError}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => void loadConfig()}
+              disabled={loading || isSaving}
+              className="min-h-[36px] px-3.5 py-1.5 rounded-xl bg-rose-500/20 hover:bg-rose-500/30 border border-rose-400/40 text-white text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+              <span>Retry</span>
+            </button>
           </div>
         </div>
       )}
