@@ -25,6 +25,7 @@ import {
   getDocFromServer,
   setDoc,
   getDocs,
+  getDocsFromServer,
   updateDoc,
   deleteDoc,
   writeBatch,
@@ -2765,10 +2766,16 @@ export async function grantManualCourseAccess(
         sale = {
           id: saleId,
           requestId: reqData.id,
+          uid: reqData.uid,
+          userName: reqData.userName || existing.displayName || '',
           amount: reqData.amount,
           userEmail: reqData.userEmail,
           planType: reqData.planType === 'all_access' ? 'All-Access Pass' : (reqData.categoryName || 'Category Pass'),
-          categoryName: reqData.categoryName,
+          planCategory: reqData.planType === 'all_access' ? 'all_access' : 'category',
+          ...(reqData.categoryId ? { categoryId: reqData.categoryId } : {}),
+          ...(reqData.categoryName ? { categoryName: reqData.categoryName } : {}),
+          status: 'approved',
+          isRefunded: false,
           date: nowIso
         };
         batch.set(doc(db, 'sales_analytics', saleId), sale);
@@ -3135,7 +3142,8 @@ export function subscribeToPaymentRequests(callback: (requests: PaymentRequest[]
     const canReadAll = isCurrentAuthUserPlatformOwner() ||
       (ownData.role === 'master_admin' && ownData.isSuspended !== true) ||
       (ownData.role === 'admin' && ownData.isSuspended !== true &&
-        Array.isArray(ownData.permissions) && ownData.permissions.includes('payments.verify'));
+        Array.isArray(ownData.permissions) &&
+        (ownData.permissions.includes('payments.verify') || ownData.permissions.includes('analytics.view')));
     const requestsQuery = canReadAll
       ? collection(db, 'paymentRequests')
       : query(collection(db, 'paymentRequests'), where('uid', '==', uid));
@@ -3254,10 +3262,16 @@ export async function resolvePaymentRequest(
     sale = {
       id: saleId,
       requestId: req.id,
+      uid: req.uid,
+      userName: req.userName || updatedStudent?.displayName || '',
       amount: req.amount,
       userEmail: req.userEmail,
       planType: req.planType === 'all_access' ? 'All-Access Pass' : (req.categoryName || 'Category Pass'),
-      categoryName: req.categoryName,
+      planCategory: req.planType === 'all_access' ? 'all_access' : 'category',
+      ...(req.categoryId ? { categoryId: req.categoryId } : {}),
+      ...(req.categoryName ? { categoryName: req.categoryName } : {}),
+      status: 'approved',
+      isRefunded: false,
       date: now
     };
     batch.set(doc(db, 'sales_analytics', saleId), sale);
@@ -3445,6 +3459,81 @@ export function subscribeToSales(callback: (sales: SalesRecord[]) => void): () =
     cancelled = true;
     unsubEvent();
     if (unsubFb) unsubFb();
+  };
+}
+
+/**
+ * Performs an idempotent fresh fetch of financial analytics data from Firestore
+ * (preferring server data via getDocsFromServer) without duplicating any state.
+ */
+export async function refreshFinancialAnalyticsData(
+  actor: UserProfile | null
+): Promise<{ sales: SalesRecord[]; approvedPayments: PaymentRequest[]; refreshedAt: string }> {
+  if (!actor || actor.isSuspended) {
+    throw new Error('Unauthorized: Active administrator account required.');
+  }
+  const canView = isProtectedOwner(actor) || hasPermission(actor, 'analytics.view');
+  if (!canView) {
+    throw new Error('Permission denied: Financial Analytics permission (analytics.view) is required.');
+  }
+  if (!db || !auth?.currentUser || auth.currentUser.uid !== actor.uid) {
+    throw new Error('Active Firebase authentication session required to refresh analytics.');
+  }
+
+  let salesList: SalesRecord[] = [];
+  const salesMap: Record<string, SalesRecord> = {};
+  try {
+    let salesSnap;
+    try {
+      salesSnap = await getDocsFromServer(collection(db, 'sales_analytics'));
+    } catch {
+      salesSnap = await getDocs(collection(db, 'sales_analytics'));
+    }
+    salesSnap.forEach((docSnap) => {
+      const item = { id: docSnap.id, ...docSnap.data() } as SalesRecord;
+      salesMap[docSnap.id] = item;
+      salesList.push(item);
+    });
+    salesList.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    writeStorage(STORAGE_KEYS.SALES, salesMap);
+    eventBus.emit('sales', salesList);
+  } catch (err: any) {
+    handleFirestoreError(err, OperationType.GET, 'sales_analytics');
+  }
+
+  let approvedPayments: PaymentRequest[] = [];
+  try {
+    const approvedQuery = query(collection(db, 'paymentRequests'), where('status', '==', 'approved'));
+    let paymentsSnap;
+    try {
+      paymentsSnap = await getDocsFromServer(approvedQuery);
+    } catch {
+      paymentsSnap = await getDocs(approvedQuery);
+    }
+    const existingPayments = readStorage<Record<string, PaymentRequest>>(STORAGE_KEYS.PAYMENTS, {});
+    const nextPayments = { ...existingPayments };
+    paymentsSnap.forEach((docSnap) => {
+      const req = { id: docSnap.id, ...docSnap.data() } as PaymentRequest;
+      nextPayments[docSnap.id] = req;
+      approvedPayments.push(req);
+    });
+    approvedPayments.sort((a, b) => new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime());
+    writeStorage(STORAGE_KEYS.PAYMENTS, nextPayments);
+    eventBus.emit('payments', Object.values(nextPayments).sort((a, b) =>
+      new Date(b.submittedAt).getTime() - new Date(a.submittedAt).getTime()
+    ));
+  } catch (err: any) {
+    // Graceful fallback: if rules restrict paymentRequests for this admin, sales_analytics still powers metrics
+    const code = String(err?.code || err?.message || '').toLowerCase();
+    if (!code.includes('permission')) {
+      console.warn('Payment requests analytics sync note:', err?.message || err);
+    }
+  }
+
+  return {
+    sales: salesList,
+    approvedPayments,
+    refreshedAt: new Date().toISOString()
   };
 }
 

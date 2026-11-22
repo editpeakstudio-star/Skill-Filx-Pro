@@ -253,7 +253,7 @@ service cloud.firestore {
           'id','uid','userEmail','userName','planType','categoryId','categoryName',
           'amount','utr','proofUrl','status','submittedAt'
         ]);
-      allow get, list: if signedIn() && (resource.data.uid == request.auth.uid || canVerifyPayments());
+      allow get, list: if signedIn() && (resource.data.uid == request.auth.uid || canVerifyPayments() || permitted('analytics.view'));
       allow update: if canVerifyPayments() && resource.data.status == 'pending'
         && request.resource.data.status in ['approved','rejected']
         && (('email' in request.auth.token && request.auth.token.email != null)

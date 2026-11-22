@@ -10,8 +10,13 @@ import {
   CheckCircle2,
   AlertCircle,
   KeyRound,
-  RotateCcw
+  RotateCcw,
+  Copy,
+  Check,
+  Globe
 } from 'lucide-react';
+import { getApps } from 'firebase/app';
+import { getAuth } from 'firebase/auth';
 import { 
   loginUser, 
   registerUser, 
@@ -52,6 +57,43 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onSuccess
   // Common UI state
   const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [copiedField, setCopiedField] = useState<string | null>(null);
+
+  const runtimeDiagnostics = React.useMemo(() => {
+    const winOrigin = typeof window !== 'undefined' ? window.location.origin : '(unavailable)';
+    const winHostname = typeof window !== 'undefined' ? window.location.hostname : '(unavailable)';
+    const winHost = typeof window !== 'undefined' ? window.location.host : '(unavailable)';
+    let firebaseAuthDomain = '(not initialized)';
+    try {
+      const apps = getApps();
+      if (apps.length > 0) {
+        const defaultApp = apps[0];
+        const fbAuth = getAuth(defaultApp);
+        firebaseAuthDomain =
+          fbAuth?.config?.authDomain ||
+          (defaultApp.options?.authDomain as string | undefined) ||
+          '(not configured)';
+      }
+    } catch {
+      firebaseAuthDomain = '(unavailable)';
+    }
+    return {
+      firebaseAuthDomain,
+      origin: winOrigin,
+      hostname: winHostname,
+      host: winHost
+    };
+  }, [isOpen]);
+
+  const handleCopyDiag = async (key: string, value: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopiedField(key);
+      setTimeout(() => setCopiedField(null), 1500);
+    } catch {
+      showToast(`${key}: ${value}`, 'info');
+    }
+  };
 
   // Countdown timer for OTP resend
   useEffect(() => {
@@ -213,8 +255,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onSuccess
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-black/85 backdrop-blur-md overflow-y-auto animate-in fade-in duration-150">
-      <div className="relative w-full max-w-4xl bg-[#050B1B] border border-blue-500/50 rounded-[28px] sm:rounded-[36px] shadow-[0_0_55px_rgba(29,78,216,0.16)] p-6 sm:p-10 text-slate-100 my-5">
+    <div className="fixed inset-0 z-50 flex items-start sm:items-center justify-center p-3 sm:p-4 bg-black/85 backdrop-blur-md overflow-y-auto animate-in fade-in duration-150">
+      <div className="relative w-full max-w-4xl bg-[#050B1B] border border-blue-500/50 rounded-[28px] sm:rounded-[36px] shadow-[0_0_55px_rgba(29,78,216,0.16)] p-6 sm:p-10 text-slate-100 my-auto">
         
         {/* Invisible Recaptcha Anchor */}
         <div id="recaptcha-verifier-box" />
@@ -401,6 +443,51 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose, onSuccess
             </div>
           </form>
         )}
+
+        {/* Temporary Runtime Domain Diagnostic Panel */}
+        <div className="mt-6 rounded-2xl border border-amber-400/35 bg-amber-950/20 p-3.5 sm:p-4 text-left">
+          <div className="flex items-center justify-between gap-2 mb-2.5">
+            <div className="flex items-center gap-2 min-w-0">
+              <Globe className="w-4 h-4 text-amber-300 shrink-0" />
+              <span className="text-xs font-bold uppercase tracking-wider text-amber-200 truncate">
+                Temporary Auth Domain Diagnostics
+              </span>
+            </div>
+            <span className="text-[10px] font-mono text-amber-300/80 shrink-0">Read-Only</span>
+          </div>
+
+          <div className="space-y-2 text-[11px] font-mono">
+            {[
+              { id: 'authDomain', label: 'Firebase Auth Runtime authDomain', value: runtimeDiagnostics.firebaseAuthDomain },
+              { id: 'origin', label: 'window.location.origin', value: runtimeDiagnostics.origin },
+              { id: 'hostname', label: 'window.location.hostname', value: runtimeDiagnostics.hostname },
+              { id: 'host', label: 'window.location.host', value: runtimeDiagnostics.host }
+            ].map((row) => (
+              <div
+                key={row.id}
+                className="flex items-center justify-between gap-2 rounded-xl bg-[#040814]/90 border border-white/10 px-3 py-2"
+              >
+                <div className="min-w-0 flex-1">
+                  <span className="text-[10px] text-slate-400 block">{row.label}</span>
+                  <span className="text-cyan-200 font-semibold break-all select-all">{row.value}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void handleCopyDiag(row.label, row.value)}
+                  className="p-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white shrink-0 cursor-pointer transition-colors"
+                  title={`Copy ${row.label}`}
+                  aria-label={`Copy ${row.label}`}
+                >
+                  {copiedField === row.label ? (
+                    <Check className="w-3.5 h-3.5 text-emerald-400" />
+                  ) : (
+                    <Copy className="w-3.5 h-3.5" />
+                  )}
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
 
       </div>
     </div>

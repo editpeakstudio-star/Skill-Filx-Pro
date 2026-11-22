@@ -110,8 +110,10 @@ import {
   recordAuditLog,
   publishVideoCatalog,
   purgeUnwantedRecordsFromFirestore,
-  cleanUnwantedLocalRecords
+  cleanUnwantedLocalRecords,
+  refreshFinancialAnalyticsData
 } from '../services/firebase';
+import { computeFinancialAnalytics, formatInr } from '../services/analyticsService';
 import {
   fetchPaymentNotificationJobs,
   retryTelegramJobFailed,
@@ -119,6 +121,7 @@ import {
 } from '../services/telegramApi';
 import { TelegramBotManager, TelegramBotManagerBoundary } from '../components/TelegramBotManager';
 import { AiConfigManager, AiConfigManagerBoundary } from '../components/AiConfigManager';
+import { AdminAnalyticsDashboard } from '../components/AdminAnalyticsDashboard';
 import { useToast } from '../components/Toast';
 
 interface AdminViewProps {
@@ -302,7 +305,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
   const isSuspended = currentUser?.isSuspended;
 
   // Granular permissions check for UI display
-  const canViewAnalytics = hasPermission(currentUser, 'analytics.view') || hasPermission(currentUser, 'dashboard.view');
+  const canViewAnalytics = isOwner || hasPermission(currentUser, 'analytics.view');
   const canManageFolders = hasPermission(currentUser, 'folders.create') || hasPermission(currentUser, 'folders.edit') || hasPermission(currentUser, 'folders.delete');
   const canManageVideos = hasPermission(currentUser, 'videos.create') || hasPermission(currentUser, 'videos.edit') || hasPermission(currentUser, 'videos.delete');
   const canManagePdfs = hasPermission(currentUser, 'pdfs.create') || hasPermission(currentUser, 'pdfs.edit') || hasPermission(currentUser, 'pdfs.delete');
@@ -316,6 +319,17 @@ export const AdminView: React.FC<AdminViewProps> = ({
     hasPermission(currentUser, 'telegram.manage') ||
     hasPermission(currentUser, 'settings.manage');
   const canManageAiConfig = isOwner || (currentUser?.role === 'master_admin' && !isSuspended);
+
+  useEffect(() => {
+    if (!currentUser || isSuspended) return;
+    if (activeTab === 'folders' && !canManageFolders) {
+      if (canViewAnalytics) setActiveTab('analytics');
+      else if (canVerifyPayments) setActiveTab('payments');
+      else if (canManageStudents) setActiveTab('users');
+      else if (canManageVideos) setActiveTab('videos');
+      else if (canManagePdfs) setActiveTab('pdfs');
+    }
+  }, [currentUser?.uid, isSuspended, activeTab, canManageFolders, canViewAnalytics, canVerifyPayments, canManageStudents, canManageVideos, canManagePdfs]);
 
   useEffect(() => {
     if (activeTab !== 'payments' || !canVerifyPayments || !currentUser) return;
@@ -1020,8 +1034,19 @@ export const AdminView: React.FC<AdminViewProps> = ({
     return l.actorEmail.toLowerCase().includes(q) || l.action.toLowerCase().includes(q) || (l.targetEmail && l.targetEmail.toLowerCase().includes(q)) || l.details.toLowerCase().includes(q);
   });
 
-  // Calculate stats
-  const totalRevenue = sales.reduce((acc, s) => acc + (s.amount || 0), 0);
+  // Calculate reconciled financial revenue (deduplicated & verified net sales only)
+  const reconciledAnalyticsSummary = React.useMemo(
+    () =>
+      computeFinancialAnalytics({
+        sales,
+        paymentRequests,
+        users,
+        categories,
+        timeframe: 'lifetime'
+      }),
+    [sales, paymentRequests, users, categories]
+  );
+  const totalRevenue = reconciledAnalyticsSummary.lifetime.revenue;
   const pendingPaymentsCount = paymentRequests.filter(p => p.status === 'pending').length;
 
   const studentCount = users.filter(u => u.role === 'user' && !isProtectedOwner(u)).length;
@@ -1115,6 +1140,21 @@ export const AdminView: React.FC<AdminViewProps> = ({
 
           {/* Mobile Horizontal Scrollable Tab Pills (Visible ONLY on mobile/tablet) */}
           <div className="flex lg:hidden overflow-x-auto no-scrollbar gap-1.5 py-1 -mx-1 px-1">
+            {canViewAnalytics && (
+              <button
+                type="button"
+                onClick={() => setActiveTab('analytics')}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold shrink-0 transition-all cursor-pointer flex items-center gap-1.5 ${
+                  activeTab === 'analytics'
+                    ? 'bg-gradient-to-r from-violet-600 to-purple-500 text-white shadow-md shadow-purple-600/35'
+                    : 'bg-[#05070D] border border-zinc-800 text-zinc-300 hover:text-white'
+                }`}
+              >
+                <TrendingUp className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Analytics</span>
+              </button>
+            )}
+
             {canManageStudents && (
               <button
                 type="button"
@@ -1250,21 +1290,6 @@ export const AdminView: React.FC<AdminViewProps> = ({
               </button>
             )}
 
-            {canViewAnalytics && (
-              <button
-                type="button"
-                onClick={() => setActiveTab('analytics')}
-                className={`px-3 py-1.5 rounded-xl text-xs font-bold shrink-0 transition-all cursor-pointer flex items-center gap-1.5 ${
-                  activeTab === 'analytics'
-                    ? 'bg-blue-600 text-white shadow-md shadow-blue-600/30'
-                    : 'bg-[#05070D] border border-zinc-800 text-zinc-400 hover:text-white'
-                }`}
-              >
-                <TrendingUp className="w-3.5 h-3.5 text-emerald-400" />
-                <span>Analytics</span>
-              </button>
-            )}
-
             {canViewAudit && (
               <button
                 type="button"
@@ -1297,7 +1322,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
                   <TrendingUp className="w-4 h-4" />
                   <span>Financial Analytics</span>
                 </div>
-                <span className="text-[10px] font-mono text-zinc-400">₹{totalRevenue}</span>
+                <span className="text-[10px] font-mono text-zinc-300 tabular-nums">{formatInr(totalRevenue)}</span>
               </button>
             )}
 
@@ -1525,59 +1550,14 @@ export const AdminView: React.FC<AdminViewProps> = ({
         {/* TAB 1: FINANCIAL ANALYTICS                               */}
         {/* ======================================================== */}
         {activeTab === 'analytics' && canViewAnalytics && (
-          <div className="space-y-5 animate-in fade-in duration-150">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div>
-                <h2 className="text-lg font-bold text-white">Financial & Sales Analytics</h2>
-                <p className="text-xs text-zinc-400">Real-time revenue monitoring and transactions registry.</p>
-              </div>
-            </div>
-
-            {/* Quick Metrics */}
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-              <div className="p-4 rounded-2xl bg-[#090D16] border border-blue-500/20">
-                <span className="text-[10px] text-zinc-400 uppercase font-bold tracking-wider">Total Sales</span>
-                <p className="text-xl font-extrabold text-amber-400 font-mono mt-1">₹{totalRevenue}</p>
-              </div>
-              <div className="p-4 rounded-2xl bg-[#090D16] border border-blue-500/20">
-                <span className="text-[10px] text-zinc-400 uppercase font-bold tracking-wider">Transactions</span>
-                <p className="text-xl font-extrabold text-white font-mono mt-1">{sales.length}</p>
-              </div>
-              <div className="p-4 rounded-2xl bg-[#090D16] border border-blue-500/20">
-                <span className="text-[10px] text-zinc-400 uppercase font-bold tracking-wider">Active Students</span>
-                <p className="text-xl font-extrabold text-cyan-400 font-mono mt-1">{users.length}</p>
-              </div>
-              <div className="p-4 rounded-2xl bg-[#090D16] border border-blue-500/20">
-                <span className="text-[10px] text-zinc-400 uppercase font-bold tracking-wider">Pending Proofs</span>
-                <p className="text-xl font-extrabold text-rose-400 font-mono mt-1">{pendingPaymentsCount}</p>
-              </div>
-            </div>
-
-            {/* Sales Table */}
-            <div className="rounded-2xl bg-[#090D16] border border-blue-500/20 overflow-hidden">
-              <div className="p-3.5 border-b border-zinc-800 flex items-center justify-between">
-                <span className="text-xs font-bold text-white uppercase tracking-wider">Recent Sales History</span>
-              </div>
-              {sales.length > 0 ? (
-                <div className="divide-y divide-zinc-800/80">
-                  {sales.map((sale) => (
-                    <div key={sale.id} className="p-3 flex items-center justify-between text-xs">
-                      <div>
-                        <span className="font-bold text-white">{sale.planType}</span>
-                        <span className="text-[10px] text-zinc-400 font-mono block">{sale.userEmail}</span>
-                      </div>
-                      <div className="text-right">
-                        <span className="font-mono font-bold text-amber-400">₹{sale.amount}</span>
-                        <span className="text-[10px] text-zinc-500 block">{new Date(sale.date).toLocaleDateString()}</span>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="p-8 text-center text-zinc-500 text-xs">No sales recorded yet.</div>
-              )}
-            </div>
-          </div>
+          <AdminAnalyticsDashboard
+            currentUser={currentUser}
+            sales={sales}
+            paymentRequests={paymentRequests}
+            users={users}
+            categories={categories}
+            onRefreshData={() => refreshFinancialAnalyticsData(currentUser)}
+          />
         )}
 
         {/* ======================================================== */}

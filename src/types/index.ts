@@ -221,6 +221,38 @@ export interface SalesRecord {
   planType: string;
   categoryName?: string;
   date: string;
+  uid?: string;
+  userName?: string;
+  categoryId?: string;
+  planCategory?: 'all_access' | 'category' | 'other';
+  status?: 'approved' | 'refunded' | 'cancelled' | 'failed' | 'pending' | 'rejected';
+  isRefunded?: boolean;
+  refundedAt?: string | null;
+}
+
+export type AnalyticsTimeframe = 'day' | 'week' | 'month' | 'lifetime';
+
+export type RevenueSegmentKey = 'individual_course' | 'all_access' | 'other';
+
+export interface NormalizedSaleTransaction {
+  id: string;
+  canonicalKey: string;
+  source: 'sales_analytics' | 'payment_request' | 'reconciled';
+  paymentRequestId?: string;
+  utr?: string;
+  uid: string;
+  studentKey: string;
+  studentName: string;
+  studentEmail: string;
+  courseKey: string;
+  courseName: string;
+  courseThumbnail?: string;
+  categoryId?: string;
+  segment: RevenueSegmentKey;
+  amount: number;
+  timestampMs: number;
+  isoDate: string;
+  status: 'approved';
 }
 
 export interface AuditLog {
