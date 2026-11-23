@@ -28,11 +28,11 @@ const WELCOME_TEXT =
   "Hey! Welcome to Skill-Flix. I'm your personal AI learning assistant. Ask me about courses, videos, PDFs, pricing, your account status, support, or video editing tips!";
 
 const SUGGESTED_QUESTIONS: string[] = [
-  'Website par kitne videos & PDFs hain?',
-  'All-Access aur course prices kya hain?',
-  'Mera subscription & courses status?',
-  'Skill-Flix ka Owner & support contact?',
-  'Help me learn video editing.'
+  'How many courses available?',
+  'Best course for beginners?',
+  'My course access status?',
+  'Latest uploaded videos?',
+  'Teach me video editing!'
 ];
 
 function createWelcomeMessage(): AiChatMessage {
