@@ -2,32 +2,26 @@ import { sanitizeError } from './crypto';
 import {
   getFirestoreAuthToken,
   getFirestoreDoc,
+  getProjectId,
   hasServiceAccountConfig,
-  listFirestoreCollection,
   verifyFirebaseIdToken
 } from './firebase';
 import { resolveWorkerAiConfig, type WorkerResolvedAiConfig } from './aiConfig';
+import {
+  getWorkerActiveCourseNames,
+  routeAndExecuteWorkerTools,
+  runWorkerSkillFlixTool,
+  WORKER_TOOL_DECLARATIONS,
+  type WorkerToolContext
+} from './aiTools';
 import { HttpError, type WorkerEnv } from './types';
 
 const DEFAULT_PROJECT_ID = 'skillflix-academy';
 const PLATFORM_OWNER_EMAIL = 'editpeakstudio@gmail.com';
+const PLATFORM_OWNER_NAME = 'Pintu Kumar';
 const MAX_MESSAGE_CHARS = 1500;
 const MAX_HISTORY_TURNS = 6;
-
-const UNWANTED_DEMO_VIDEO_IDS = new Set([
-  'vid_am_vectors',
-  'vid_am_null_rigs',
-  'vid_am_3d_camera',
-  'vid_cap_velocity',
-  'vid_cap_effects',
-  'vid_prem_lumetri',
-  'vid_ae_saber'
-]);
-
-const UNWANTED_DEMO_PDF_IDS = new Set([
-  'pdf_am_cheatsheet',
-  'pdf_cap_curves'
-]);
+const MAX_TOOL_ROUNDS = 2;
 
 interface WorkerRateBucket {
   minuteTimestamps: number[];
@@ -40,24 +34,8 @@ interface UserProfileCacheEntry {
   expiresAt: number;
 }
 
-interface CatalogCacheEntry {
-  cats: Record<string, unknown>[];
-  folders: Record<string, unknown>[];
-  videos: Record<string, unknown>[];
-  pdfs?: Record<string, unknown>[];
-  expiresAt: number;
-}
-
-interface UserPdfCacheEntry {
-  pdfs: Record<string, unknown>[];
-  expiresAt: number;
-}
-
 const workerRateBuckets = new Map<string, WorkerRateBucket>();
 const userProfileCache = new Map<string, UserProfileCacheEntry>();
-const publicCatalogCache = new Map<string, CatalogCacheEntry>();
-const adminCatalogCache = new Map<string, CatalogCacheEntry>();
-const userPdfCache = new Map<string, UserPdfCacheEntry>();
 
 function getWorkerQuota(
   uid: string,
@@ -172,61 +150,6 @@ async function fetchAiWithTimeout(
   }
 }
 
-function decodeFsVal(val: Record<string, any>): unknown {
-  if (!val || typeof val !== 'object') return undefined;
-  if ('stringValue' in val) return val.stringValue;
-  if ('integerValue' in val) return Number(val.integerValue);
-  if ('doubleValue' in val) return Number(val.doubleValue);
-  if ('booleanValue' in val) return val.booleanValue;
-  if ('nullValue' in val) return null;
-  if ('timestampValue' in val) return val.timestampValue;
-  if ('arrayValue' in val) {
-    return Array.isArray(val.arrayValue?.values) ? val.arrayValue.values.map(decodeFsVal) : [];
-  }
-  if ('mapValue' in val) {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(val.mapValue?.fields || {})) {
-      out[k] = decodeFsVal(v as Record<string, any>);
-    }
-    return out;
-  }
-  return undefined;
-}
-
-async function runWorkerFirestoreQuery(
-  env: WorkerEnv,
-  idToken: string,
-  structuredQuery: Record<string, unknown>
-): Promise<Record<string, unknown>[]> {
-  const projectId = (env.FIREBASE_PROJECT_ID || DEFAULT_PROJECT_ID).trim();
-  const res = await fetchAiWithTimeout(
-    `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/(default)/documents:runQuery`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${idToken}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json'
-      },
-      body: JSON.stringify({ structuredQuery })
-    },
-    8000
-  );
-  if (!res.ok) return [];
-  const rows = (await res.json()) as Array<{ document?: { name?: string; fields?: Record<string, any> } }>;
-  const docs: Record<string, unknown>[] = [];
-  for (const row of rows) {
-    if (!row.document) continue;
-    const out: Record<string, unknown> = {};
-    if (row.document.name) out.id = row.document.name.split('/').pop();
-    for (const [k, v] of Object.entries(row.document.fields || {})) {
-      out[k] = decodeFsVal(v);
-    }
-    docs.push(out);
-  }
-  return docs;
-}
-
 function classifyGeminiRestFailure(
   status: number,
   bodyText: string,
@@ -296,11 +219,32 @@ function classifyGeminiRestFailure(
   );
 }
 
-function buildGeminiPayload(
+interface GeminiRestPart {
+  text?: string;
+  thought?: boolean;
+  thoughtSignature?: string;
+  functionCall?: {
+    id?: string;
+    name?: string;
+    args?: Record<string, unknown>;
+  };
+  functionResponse?: {
+    id?: string;
+    name: string;
+    response: Record<string, unknown>;
+  };
+}
+
+interface GeminiRestContent {
+  role: string;
+  parts: GeminiRestPart[];
+}
+
+function buildGeminiRestPayload(
   modelName: string,
   systemInstruction: string,
-  history: Array<{ role: 'user' | 'model'; text: string }>,
-  userMessage: string
+  contents: GeminiRestContent[],
+  includeTools: boolean
 ) {
   const supportsThinkingLevel = /^gemini-(?:3|4)/i.test(modelName);
   const isFlashLite = /flash-lite/i.test(modelName);
@@ -309,10 +253,8 @@ function buildGeminiPayload(
     ...(systemInstruction
       ? { systemInstruction: { parts: [{ text: systemInstruction }] } }
       : {}),
-    contents: [
-      ...history.map(h => ({ role: h.role, parts: [{ text: h.text }] })),
-      { role: 'user', parts: [{ text: userMessage }] }
-    ],
+    contents,
+    ...(includeTools ? { tools: [{ functionDeclarations: WORKER_TOOL_DECLARATIONS }] } : {}),
     ...(supportsThinkingLevel
       ? {
           generationConfig: {
@@ -325,6 +267,24 @@ function buildGeminiPayload(
   };
 }
 
+function buildInitialContents(
+  history: Array<{ role: 'user' | 'model'; text: string }>,
+  userMessage: string
+): GeminiRestContent[] {
+  return [
+    ...history.map(h => ({ role: h.role, parts: [{ text: h.text }] })),
+    { role: 'user', parts: [{ text: userMessage }] }
+  ];
+}
+
+function extractRestPartsText(parts?: GeminiRestPart[]): string {
+  if (!Array.isArray(parts)) return '';
+  return parts
+    .filter(p => !p.thought && typeof p.text === 'string' && p.text.length > 0)
+    .map(p => p.text!)
+    .join('');
+}
+
 async function generateWithWorkerGemini(
   apiKey: string,
   primaryModel: string,
@@ -333,56 +293,119 @@ async function generateWithWorkerGemini(
   history: Array<{ role: 'user' | 'model'; text: string }>,
   userMessage: string,
   quota?: ReturnType<typeof getWorkerQuota>,
-  signal?: AbortSignal
+  toolCtx?: WorkerToolContext,
+  signal?: AbortSignal,
+  customPrimaryTimeoutMs?: number
 ): Promise<{ text: string; model: string }> {
   const modelsToTry = Array.from(new Set([primaryModel, fallbackModel].filter(Boolean)));
+  const baseContents = buildInitialContents(history, userMessage);
   let lastStatus = 502;
   let lastBody = '';
   let lastError: HttpError | null = null;
 
-  for (const modelName of modelsToTry) {
-    try {
-      const geminiRes = await fetchAiWithTimeout(
-        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-goog-api-key': apiKey
-          },
-          body: JSON.stringify(buildGeminiPayload(modelName, systemInstruction, history, userMessage))
-        },
-        25_000,
-        [apiKey],
-        signal
-      );
+  for (let mIdx = 0; mIdx < modelsToTry.length; mIdx++) {
+    const modelName = modelsToTry[mIdx];
+    const hasMoreModels = mIdx < modelsToTry.length - 1;
+    const timeoutMs = hasMoreModels
+      ? (customPrimaryTimeoutMs ?? 12_000)
+      : (customPrimaryTimeoutMs ?? 18_000);
 
-      if (geminiRes.ok) {
-        const json = (await geminiRes.json().catch(() => ({}))) as {
-          candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-        };
-        const text = (json.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '').trim();
-        if (text) {
-          return { text, model: modelName };
+    try {
+      let contents: GeminiRestContent[] = [...baseContents];
+      let finalText = '';
+
+      for (let round = 0; round <= (toolCtx ? MAX_TOOL_ROUNDS : 0); round++) {
+        const allowToolsThisRound = Boolean(toolCtx && round < MAX_TOOL_ROUNDS);
+        const geminiRes = await fetchAiWithTimeout(
+          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:generateContent`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-goog-api-key': apiKey,
+              'User-Agent': 'aistudio-build'
+            },
+            body: JSON.stringify(buildGeminiRestPayload(modelName, systemInstruction, contents, allowToolsThisRound))
+          },
+          timeoutMs,
+          [apiKey],
+          signal
+        );
+
+        if (!geminiRes.ok) {
+          lastStatus = geminiRes.status;
+          lastBody = await geminiRes.text().catch(() => '');
+          const upper = lastBody.toUpperCase();
+          const isAuthOrInvalidKey =
+            lastStatus === 401 ||
+            lastStatus === 403 ||
+            (lastStatus === 400 && (upper.includes('API_KEY') || upper.includes('KEY_INVALID')));
+          if (isAuthOrInvalidKey) {
+            throw classifyGeminiRestFailure(lastStatus, lastBody, quota, [apiKey]);
+          }
+          if (!hasMoreModels && lastStatus === 400) {
+            throw classifyGeminiRestFailure(lastStatus, lastBody, quota, [apiKey]);
+          }
+          finalText = '';
+          break;
         }
-        lastStatus = 502;
-        lastBody = 'Empty response from Gemini model.';
-        continue;
+
+        const json = (await geminiRes.json().catch(() => ({}))) as {
+          candidates?: Array<{ content?: GeminiRestContent }>;
+        };
+        const candidateContent = json.candidates?.[0]?.content;
+        const parts = candidateContent?.parts || [];
+        const calls = parts
+          .filter(p => Boolean(p.functionCall?.name))
+          .map(p => p.functionCall!);
+
+        if (allowToolsThisRound && toolCtx && calls.length > 0 && candidateContent) {
+          const toolResults = await Promise.all(
+            calls.map(call => runWorkerSkillFlixTool(call.name || '', call.args, toolCtx))
+          );
+
+          const responseParts: GeminiRestPart[] = calls.map((call, idx) => {
+            const res = toolResults[idx];
+            return {
+              functionResponse: {
+                ...(call.id ? { id: call.id } : {}),
+                name: call.name || 'unknown',
+                response:
+                  res.status === 'ok'
+                    ? { output: res.data || {} }
+                    : { error: res.error || 'Tool unavailable' }
+              }
+            };
+          });
+
+          contents = [
+            ...contents,
+            { role: candidateContent.role || 'model', parts },
+            { role: 'user', parts: responseParts }
+          ];
+          continue;
+        }
+
+        finalText = extractRestPartsText(parts).trim();
+        break;
       }
 
-      lastStatus = geminiRes.status;
-      lastBody = await geminiRes.text().catch(() => '');
-      const upper = lastBody.toUpperCase();
-      const isAuthOrInvalidKey =
-        lastStatus === 401 ||
-        lastStatus === 403 ||
-        (lastStatus === 400 && (upper.includes('API_KEY') || upper.includes('KEY_INVALID')));
-      if (isAuthOrInvalidKey) {
-        throw classifyGeminiRestFailure(lastStatus, lastBody, quota, [apiKey]);
+      if (finalText) {
+        return { text: finalText, model: modelName };
+      }
+      if (!lastBody) {
+        lastStatus = 502;
+        lastBody = 'Empty response from Gemini model.';
       }
     } catch (err: any) {
       if (err instanceof HttpError && err.status === 499) throw err;
-      if (err instanceof HttpError && err.status !== 504 && err.status !== 503) {
+      if (
+        err instanceof HttpError &&
+        err.status !== 504 &&
+        err.status !== 503 &&
+        err.status !== 429 &&
+        err.status !== 404
+      ) {
         throw err;
       }
       lastError = err instanceof HttpError ? err : null;
@@ -391,7 +414,319 @@ async function generateWithWorkerGemini(
     }
   }
 
-  if (lastError && (lastError.status === 504 || lastError.status === 503)) {
+  if (lastError && (lastError.status === 504 || lastError.status === 503 || lastError.status === 429)) {
+    throw lastError;
+  }
+  throw classifyGeminiRestFailure(lastStatus, lastBody, quota, [apiKey]);
+}
+
+async function consumeSseLines(
+  stream: ReadableStream<Uint8Array>,
+  onEventData: (dataStr: string) => void,
+  signal?: AbortSignal,
+  timeouts?: { firstByteTimeoutMs?: number; idleTimeoutMs?: number }
+): Promise<void> {
+  if (signal?.aborted) {
+    await stream.cancel().catch(() => {});
+    throw new HttpError(499, 'AI request was cancelled.', 'AI_CANCELLED');
+  }
+
+  const reader = stream.getReader();
+  const onAbort = () => {
+    void reader.cancel().catch(() => {});
+  };
+  signal?.addEventListener('abort', onAbort, { once: true });
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let dataLines: string[] = [];
+  let hasReceivedData = false;
+
+  const readChunkWithTimeout = async () => {
+    const ms = hasReceivedData
+      ? (timeouts?.idleTimeoutMs ?? 15_000)
+      : (timeouts?.firstByteTimeoutMs ?? 14_000);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            void reader.cancel().catch(() => {});
+            reject(
+              new HttpError(
+                504,
+                'Skill-Flix AI took too long to respond from Gemini. Please try again in a moment.',
+                'AI_TIMEOUT'
+              )
+            );
+          }, ms);
+        })
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
+
+  try {
+    while (true) {
+      if (signal?.aborted) {
+        throw new HttpError(499, 'AI request was cancelled.', 'AI_CANCELLED');
+      }
+      const { value, done } = await readChunkWithTimeout();
+      if (signal?.aborted) {
+        throw new HttpError(499, 'AI request was cancelled.', 'AI_CANCELLED');
+      }
+      if (done) break;
+      hasReceivedData = true;
+      buffer += decoder.decode(value, { stream: true });
+
+      let nlIdx: number;
+      while ((nlIdx = buffer.indexOf('\n')) !== -1) {
+        if (signal?.aborted) {
+          throw new HttpError(499, 'AI request was cancelled.', 'AI_CANCELLED');
+        }
+        const line = buffer.slice(0, nlIdx).replace(/\r$/, '');
+        buffer = buffer.slice(nlIdx + 1);
+
+        if (line === '') {
+          if (dataLines.length > 0) {
+            onEventData(dataLines.join('\n'));
+            dataLines = [];
+          }
+          continue;
+        }
+        if (line.startsWith('data:')) {
+          dataLines.push(line.slice(5).trimStart());
+        }
+      }
+    }
+
+    buffer += decoder.decode();
+    if (buffer.trim().startsWith('data:')) {
+      dataLines.push(buffer.trim().slice(5).trimStart());
+    }
+    if (dataLines.length > 0) {
+      onEventData(dataLines.join('\n'));
+    }
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+    reader.releaseLock();
+  }
+}
+
+async function streamWithWorkerGemini(
+  apiKey: string,
+  primaryModel: string,
+  fallbackModel: string,
+  systemInstruction: string,
+  history: Array<{ role: 'user' | 'model'; text: string }>,
+  userMessage: string,
+  quota: ReturnType<typeof getWorkerQuota>,
+  toolCtx: WorkerToolContext,
+  onStartModel: (modelName: string) => void,
+  onDelta: (delta: string) => void,
+  signal?: AbortSignal
+): Promise<{ text: string; model: string }> {
+  const modelsToTry = Array.from(new Set([primaryModel, fallbackModel].filter(Boolean)));
+  const baseContents = buildInitialContents(history, userMessage);
+  let lastStatus = 502;
+  let lastBody = '';
+  let lastError: HttpError | null = null;
+  let anyEmitted = false;
+
+  for (let mIdx = 0; mIdx < modelsToTry.length; mIdx++) {
+    const modelName = modelsToTry[mIdx];
+    const hasMoreModels = mIdx < modelsToTry.length - 1;
+    const firstTokenTimeoutMs = hasMoreModels ? 12_000 : 18_000;
+    const chunkIdleTimeoutMs = 15_000;
+
+    let emittedForModel = false;
+    let startedModel = false;
+    let accumulated = '';
+    let contents: GeminiRestContent[] = [...baseContents];
+
+    try {
+      for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+        const allowToolsThisRound = round < MAX_TOOL_ROUNDS;
+        const res = await fetchAiWithTimeout(
+          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:streamGenerateContent?alt=sse`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'text/event-stream',
+              'x-goog-api-key': apiKey,
+              'User-Agent': 'aistudio-build'
+            },
+            body: JSON.stringify(buildGeminiRestPayload(modelName, systemInstruction, contents, allowToolsThisRound))
+          },
+          firstTokenTimeoutMs,
+          [apiKey],
+          signal
+        );
+
+        if (!res.ok) {
+          lastStatus = res.status;
+          lastBody = await res.text().catch(() => '');
+          const upper = lastBody.toUpperCase();
+          const isAuthOrInvalidKey =
+            lastStatus === 401 ||
+            lastStatus === 403 ||
+            (lastStatus === 400 && (upper.includes('API_KEY') || upper.includes('KEY_INVALID')));
+          if (isAuthOrInvalidKey) {
+            throw classifyGeminiRestFailure(lastStatus, lastBody, quota, [apiKey]);
+          }
+          break;
+        }
+
+        if (!res.body) {
+          lastStatus = 502;
+          lastBody = 'Missing response body stream.';
+          break;
+        }
+
+        const collectedParts: GeminiRestPart[] = [];
+        const collectedCalls: Array<{ id?: string; name?: string; args?: Record<string, unknown> }> = [];
+        let roundText = '';
+
+        const contentType = (res.headers.get('content-type') || '').toLowerCase();
+        if (contentType.includes('application/json') && !contentType.includes('event-stream')) {
+          const json = (await res.json().catch(() => ({}))) as {
+            candidates?: Array<{ content?: GeminiRestContent }>;
+          };
+          const parts = json.candidates?.[0]?.content?.parts || [];
+          for (const part of parts) {
+            if (part && Object.keys(part).length > 0) collectedParts.push(part);
+            if (part.functionCall?.name) {
+              collectedCalls.push(part.functionCall);
+            } else if (!part.thought && typeof part.text === 'string' && part.text.length > 0) {
+              roundText += part.text;
+            }
+          }
+          if (roundText && collectedCalls.length === 0) {
+            onStartModel(modelName);
+            onDelta(roundText);
+            return { text: roundText.trim(), model: modelName };
+          }
+        } else {
+          await consumeSseLines(
+            res.body,
+            rawData => {
+              if (!rawData || rawData === '[DONE]') return;
+              try {
+                const parsed = JSON.parse(rawData) as {
+                  candidates?: Array<{ content?: GeminiRestContent }>;
+                };
+                const parts = parsed.candidates?.[0]?.content?.parts || [];
+                for (const part of parts) {
+                  if (part && Object.keys(part).length > 0) {
+                    collectedParts.push(part);
+                  }
+                  if (part.functionCall?.name) {
+                    collectedCalls.push(part.functionCall);
+                  } else if (!part.thought && typeof part.text === 'string' && part.text.length > 0) {
+                    if (!startedModel) {
+                      startedModel = true;
+                      onStartModel(modelName);
+                    }
+                    emittedForModel = true;
+                    anyEmitted = true;
+                    roundText += part.text;
+                    accumulated += part.text;
+                    onDelta(part.text);
+                  }
+                }
+              } catch {
+                // Ignore malformed keepalive SSE chunk
+              }
+            },
+            signal,
+            { firstByteTimeoutMs: firstTokenTimeoutMs, idleTimeoutMs: chunkIdleTimeoutMs }
+          );
+        }
+
+        if (allowToolsThisRound && collectedCalls.length > 0 && !emittedForModel) {
+          const toolResults = await Promise.all(
+            collectedCalls.map(call => runWorkerSkillFlixTool(call.name || '', call.args, toolCtx))
+          );
+
+          const responseParts: GeminiRestPart[] = collectedCalls.map((call, idx) => {
+            const tr = toolResults[idx];
+            return {
+              functionResponse: {
+                ...(call.id ? { id: call.id } : {}),
+                name: call.name || 'unknown',
+                response:
+                  tr.status === 'ok'
+                    ? { output: tr.data || {} }
+                    : { error: tr.error || 'Tool unavailable' }
+              }
+            };
+          });
+
+          contents = [
+            ...contents,
+            { role: 'model', parts: collectedParts },
+            { role: 'user', parts: responseParts }
+          ];
+          continue;
+        }
+
+        const finalText = (accumulated || roundText).trim();
+        if (finalText) {
+          return { text: finalText, model: modelName };
+        }
+        lastStatus = 502;
+        lastBody = 'Empty streaming response from Gemini.';
+        break;
+      }
+    } catch (err: any) {
+      if (err instanceof HttpError && err.status === 499) throw err;
+      if (emittedForModel) {
+        const cleanPartial = accumulated.trim();
+        if (cleanPartial) return { text: cleanPartial, model: modelName };
+      }
+      if (
+        err instanceof HttpError &&
+        err.status !== 504 &&
+        err.status !== 503 &&
+        err.status !== 429 &&
+        err.status !== 404
+      ) {
+        throw err;
+      }
+      lastError = err instanceof HttpError ? err : null;
+      lastStatus = lastError?.status || 503;
+      lastBody = lastError?.message || '';
+    }
+  }
+
+  // Last-resort fast non-stream backup with full tool calling
+  const fastModel = fallbackModel || primaryModel;
+  if (!anyEmitted && fastModel && !signal?.aborted) {
+    try {
+      const backup = await generateWithWorkerGemini(
+        apiKey,
+        fastModel,
+        '',
+        systemInstruction,
+        history,
+        userMessage,
+        quota,
+        toolCtx,
+        signal,
+        12_000
+      );
+      onStartModel(backup.model);
+      onDelta(backup.text);
+      return backup;
+    } catch {
+      // Fall through to classified error
+    }
+  }
+
+  if (lastError && (lastError.status === 504 || lastError.status === 503 || lastError.status === 429)) {
     throw lastError;
   }
   throw classifyGeminiRestFailure(lastStatus, lastBody, quota, [apiKey]);
@@ -500,193 +835,6 @@ async function generateWithWorkerOpenAiProvider(
     `Upstream ${provider} AI request failed (${lastStatus})${lastBody ? `: ${lastBody.slice(0, 120)}` : '.'}`,
     lastStatus === 503 ? 'AI_PROVIDER_UNAVAILABLE' : 'AI_UPSTREAM_ERROR'
   );
-}
-
-async function consumeSseLines(
-  stream: ReadableStream<Uint8Array>,
-  onEventData: (dataStr: string) => void,
-  signal?: AbortSignal
-): Promise<void> {
-  if (signal?.aborted) {
-    await stream.cancel().catch(() => {});
-    throw new HttpError(499, 'AI request was cancelled.', 'AI_CANCELLED');
-  }
-
-  const reader = stream.getReader();
-  const onAbort = () => {
-    void reader.cancel().catch(() => {});
-  };
-  signal?.addEventListener('abort', onAbort, { once: true });
-
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let dataLines: string[] = [];
-
-  try {
-    while (true) {
-      if (signal?.aborted) {
-        throw new HttpError(499, 'AI request was cancelled.', 'AI_CANCELLED');
-      }
-      const { value, done } = await reader.read();
-      if (signal?.aborted) {
-        throw new HttpError(499, 'AI request was cancelled.', 'AI_CANCELLED');
-      }
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      let nlIdx: number;
-      while ((nlIdx = buffer.indexOf('\n')) !== -1) {
-        if (signal?.aborted) {
-          throw new HttpError(499, 'AI request was cancelled.', 'AI_CANCELLED');
-        }
-        const line = buffer.slice(0, nlIdx).replace(/\r$/, '');
-        buffer = buffer.slice(nlIdx + 1);
-
-        if (line === '') {
-          if (dataLines.length > 0) {
-            onEventData(dataLines.join('\n'));
-            dataLines = [];
-          }
-          continue;
-        }
-        if (line.startsWith('data:')) {
-          dataLines.push(line.slice(5).trimStart());
-        }
-      }
-    }
-
-    buffer += decoder.decode();
-    if (buffer.trim().startsWith('data:')) {
-      dataLines.push(buffer.trim().slice(5).trimStart());
-    }
-    if (dataLines.length > 0) {
-      onEventData(dataLines.join('\n'));
-    }
-  } finally {
-    signal?.removeEventListener('abort', onAbort);
-    reader.releaseLock();
-  }
-}
-
-async function streamWithWorkerGemini(
-  apiKey: string,
-  primaryModel: string,
-  fallbackModel: string,
-  systemInstruction: string,
-  history: Array<{ role: 'user' | 'model'; text: string }>,
-  userMessage: string,
-  quota: ReturnType<typeof getWorkerQuota>,
-  onStartModel: (modelName: string) => void,
-  onDelta: (delta: string) => void,
-  signal?: AbortSignal
-): Promise<{ text: string; model: string }> {
-  const modelsToTry = Array.from(new Set([primaryModel, fallbackModel].filter(Boolean)));
-  let lastStatus = 502;
-  let lastBody = '';
-  let lastError: HttpError | null = null;
-
-  for (const modelName of modelsToTry) {
-    let emittedForModel = false;
-    let accumulated = '';
-    try {
-      const res = await fetchAiWithTimeout(
-        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelName)}:streamGenerateContent?alt=sse`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Accept: 'text/event-stream',
-            'x-goog-api-key': apiKey
-          },
-          body: JSON.stringify(buildGeminiPayload(modelName, systemInstruction, history, userMessage))
-        },
-        28_000,
-        [apiKey],
-        signal
-      );
-
-      if (!res.ok) {
-        lastStatus = res.status;
-        lastBody = await res.text().catch(() => '');
-        const upper = lastBody.toUpperCase();
-        const isAuthOrInvalidKey =
-          lastStatus === 401 ||
-          lastStatus === 403 ||
-          (lastStatus === 400 && (upper.includes('API_KEY') || upper.includes('KEY_INVALID')));
-        if (isAuthOrInvalidKey) {
-          throw classifyGeminiRestFailure(lastStatus, lastBody, quota, [apiKey]);
-        }
-        continue;
-      }
-
-      if (!res.body) {
-        lastStatus = 502;
-        lastBody = 'Missing response body stream.';
-        continue;
-      }
-
-      const contentType = (res.headers.get('content-type') || '').toLowerCase();
-      if (contentType.includes('application/json') && !contentType.includes('event-stream')) {
-        const json = (await res.json().catch(() => ({}))) as {
-          candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-        };
-        const text = (json.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '').trim();
-        if (text) {
-          onStartModel(modelName);
-          onDelta(text);
-          return { text, model: modelName };
-        }
-        lastStatus = 502;
-        continue;
-      }
-
-      onStartModel(modelName);
-      await consumeSseLines(
-        res.body,
-        rawData => {
-          if (!rawData || rawData === '[DONE]') return;
-          try {
-            const parsed = JSON.parse(rawData) as {
-              candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-            };
-            const chunkText = parsed.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';
-            if (chunkText) {
-              emittedForModel = true;
-              accumulated += chunkText;
-              onDelta(chunkText);
-            }
-          } catch {
-            // Ignore malformed keepalive SSE chunk
-          }
-        },
-        signal
-      );
-
-      const finalText = accumulated.trim();
-      if (finalText) {
-        return { text: finalText, model: modelName };
-      }
-      lastStatus = 502;
-      lastBody = 'Empty streaming response from Gemini.';
-    } catch (err: any) {
-      if (err instanceof HttpError && err.status === 499) throw err;
-      if (emittedForModel) {
-        const cleanPartial = accumulated.trim();
-        if (cleanPartial) return { text: cleanPartial, model: modelName };
-      }
-      if (err instanceof HttpError && err.status !== 504 && err.status !== 503) {
-        throw err;
-      }
-      lastError = err instanceof HttpError ? err : null;
-      lastStatus = lastError?.status || 503;
-      lastBody = lastError?.message || '';
-    }
-  }
-
-  if (lastError && (lastError.status === 504 || lastError.status === 503)) {
-    throw lastError;
-  }
-  throw classifyGeminiRestFailure(lastStatus, lastBody, quota, [apiKey]);
 }
 
 async function streamWithWorkerOpenAiProvider(
@@ -802,7 +950,8 @@ async function streamWithWorkerOpenAiProvider(
           // ignore keepalive frame
         }
       },
-      signal
+      signal,
+      { firstByteTimeoutMs: 14_000, idleTimeoutMs: 14_000 }
     );
 
     const finalText = accumulated.trim();
@@ -831,25 +980,6 @@ async function streamWithWorkerOpenAiProvider(
     `Upstream ${provider} AI request failed (${lastStatus})${lastBody ? `: ${lastBody.slice(0, 120)}` : '.'}`,
     lastStatus === 503 ? 'AI_PROVIDER_UNAVAILABLE' : 'AI_UPSTREAM_ERROR'
   );
-}
-
-function tokenizeQuery(input: string): string[] {
-  return input
-    .toLowerCase()
-    .replace(/[^a-z0-9\u0900-\u097f]+/gi, ' ')
-    .split(/\s+/)
-    .map(t => t.trim())
-    .filter(t => t.length >= 2);
-}
-
-function scoreTextMatch(haystack: string, tokens: string[]): number {
-  if (!tokens.length) return 0;
-  const lower = haystack.toLowerCase();
-  let score = 0;
-  for (const tok of tokens) {
-    if (lower.includes(tok)) score += 1;
-  }
-  return score;
 }
 
 function pruneHistory(rawHistory: unknown): Array<{ role: 'user' | 'model'; text: string }> {
@@ -884,134 +1014,41 @@ async function fetchCachedUserProfile(env: WorkerEnv, uid: string, idToken: stri
 
   const profile = await getFirestoreDoc(env, idToken, 'users', uid).catch(() => null);
   if (userProfileCache.size > 300) userProfileCache.clear();
-  userProfileCache.set(key, { profile, expiresAt: now + 15_000 });
+  userProfileCache.set(key, { profile, expiresAt: now + 5_000 });
   return profile;
 }
 
-async function fetchPublicCatalog(
-  env: WorkerEnv,
-  token: string,
-  includePdfs: boolean,
-  isAdmin: boolean
-): Promise<CatalogCacheEntry> {
-  const projectId = (env.FIREBASE_PROJECT_ID || DEFAULT_PROJECT_ID).trim();
-  const now = Date.now();
-  const cacheMap = isAdmin ? adminCatalogCache : publicCatalogCache;
-  const cached = cacheMap.get(projectId);
-  if (cached && cached.expiresAt > now && (!includePdfs || cached.pdfs !== undefined)) {
-    return cached;
-  }
-
-  const [cats, folders, videos, pdfs] = await Promise.all([
-    isAdmin
-      ? listFirestoreCollection(env, token, 'categories').catch(() => [])
-      : runWorkerFirestoreQuery(env, token, {
-          from: [{ collectionId: 'categories' }],
-          where: { fieldFilter: { field: { fieldPath: 'isActive' }, op: 'EQUAL', value: { booleanValue: true } } },
-          limit: 100
-        }).catch(() => []),
-    listFirestoreCollection(env, token, 'folders').catch(() => []),
-    runWorkerFirestoreQuery(env, token, {
-      from: [{ collectionId: 'videoCatalog' }],
-      where: { fieldFilter: { field: { fieldPath: 'isPublished' }, op: 'EQUAL', value: { booleanValue: true } } },
-      limit: 250
-    }).catch(() => []),
-    includePdfs
-      ? (isAdmin
-          ? listFirestoreCollection(env, token, 'pdfs').catch(() => [])
-          : runWorkerFirestoreQuery(env, token, {
-              from: [{ collectionId: 'pdfs' }],
-              where: { fieldFilter: { field: { fieldPath: 'isPublished' }, op: 'EQUAL', value: { booleanValue: true } } },
-              limit: 200
-            }).catch(() => []))
-      : Promise.resolve(undefined)
-  ]);
-
-  const entry: CatalogCacheEntry = {
-    cats,
-    folders,
-    videos,
-    pdfs,
-    expiresAt: now + 60_000
-  };
-  cacheMap.set(projectId, entry);
-  return entry;
+function buildWorkerSystemInstruction(viewerFirstName: string, viewerRole: string): string {
+  return `You are **Skill-Flix AI** ("Your Personal Learning Assistant") on Skill-Flix Pro.
+Language: Reply naturally in Hindi, Hinglish, or English matching the user's language and tone. Use clear bullet points or numbered steps when listing items.
+Capabilities & Real-Time Grounding:
+- You assist students with Skill-Flix courses, video editing (Alight Motion, CapCut, Premiere Pro, After Effects), live website catalog/counts/prices, personal student access/subscriptions, leadership hierarchy, and public support channels.
+- ALWAYS call the provided Skill-Flix tools to retrieve current numbers, prices, courses, PDF counts, personal unlock/expiry status, payment history, public support channels, and Owner/Admin directory. NEVER guess or invent counts, prices, or unlock statuses.
+Security & Privacy Rules (STRICT):
+- Account tools check ONLY the currently signed-in authenticated account. If a user asks for another student's account, another UID, or another email (e.g. checking a different user's courses or purchases), politely decline and explain you can only check their own signed-in account.
+- If a user asks for admin-only financial analytics (total sales/revenue), customer lists, other users' UTRs, audit logs, API keys, or private admin emails/phone numbers, politely decline.
+- Never output raw videoUrl, pdfUrl, UIDs, or private staff contact details.
+- If subscriptionStatus is "expired" or isExpired is true, clearly state that their subscription/access has expired and guide them to renew.
+Current user: ${viewerFirstName} (role: ${viewerRole}).`;
 }
 
-async function fetchUserPdfsCached(
-  env: WorkerEnv,
-  uid: string,
-  idToken: string,
-  hasAllAccess: boolean,
-  unlockedSet: Set<string>,
-  sharedPdfs?: Record<string, unknown>[]
-): Promise<Record<string, unknown>[]> {
-  // When fetched via Service Account, strictly enforce per-student category access in memory
-  if (sharedPdfs) {
-    if (hasAllAccess) return sharedPdfs;
-    if (unlockedSet.size === 0) return [];
-    return sharedPdfs.filter(p => unlockedSet.has(String(p.categoryId || '')));
-  }
-
-  if (!hasAllAccess && unlockedSet.size === 0) return [];
-
-  const sortedIds = Array.from(unlockedSet).sort().join(',');
-  const key = `${uid}:${hasAllAccess ? '1' : '0'}:${sortedIds}`;
-  const now = Date.now();
-  const cached = userPdfCache.get(key);
-  if (cached && cached.expiresAt > now) {
-    return cached.pdfs;
-  }
-
-  let rawPdfs: Record<string, unknown>[] = [];
-  if (hasAllAccess) {
-    rawPdfs = await runWorkerFirestoreQuery(env, idToken, {
-      from: [{ collectionId: 'pdfs' }],
-      where: { fieldFilter: { field: { fieldPath: 'isPublished' }, op: 'EQUAL', value: { booleanValue: true } } },
-      limit: 200
-    }).catch(() => []);
-  } else {
-    const lists = await Promise.all(
-      Array.from(unlockedSet).slice(0, 20).map(catId =>
-        runWorkerFirestoreQuery(env, idToken, {
-          from: [{ collectionId: 'pdfs' }],
-          where: {
-            compositeFilter: {
-              op: 'AND',
-              filters: [
-                { fieldFilter: { field: { fieldPath: 'isPublished' }, op: 'EQUAL', value: { booleanValue: true } } },
-                { fieldFilter: { field: { fieldPath: 'categoryId' }, op: 'EQUAL', value: { stringValue: catId } } }
-              ]
-            }
-          },
-          limit: 60
-        }).catch(() => [])
-      )
-    );
-    rawPdfs = lists.flat();
-  }
-
-  if (userPdfCache.size > 300) userPdfCache.clear();
-  userPdfCache.set(key, { pdfs: rawPdfs, expiresAt: now + 30_000 });
-  return rawPdfs;
-}
-
-interface PreparedWorkerChat {
+interface ValidatedWorkerChat {
+  caller: Awaited<ReturnType<typeof verifyFirebaseIdToken>>;
   cfg: WorkerResolvedAiConfig;
   isGeminiProvider: boolean;
   altKey: string;
   quota: ReturnType<typeof getWorkerQuota>;
+  toolCtx: WorkerToolContext;
   systemInstruction: string;
   cleanHistory: Array<{ role: 'user' | 'model'; text: string }>;
   cleanMessage: string;
-  courseNames: string[];
 }
 
-async function prepareWorkerChat(
+async function validateWorkerChatRequest(
   authHeader: string | null,
   env: WorkerEnv,
   body: { message?: unknown; history?: unknown }
-): Promise<PreparedWorkerChat> {
+): Promise<ValidatedWorkerChat> {
   const tokenMatch = (authHeader || '').match(/^Bearer\s+(.+)$/i);
   const idToken = tokenMatch ? tokenMatch[1].trim() : '';
   if (!idToken) {
@@ -1032,20 +1069,12 @@ async function prepareWorkerChat(
 
   const cleanHistory = pruneHistory(body.history);
 
-  // Run Firebase ID token verification & AI config resolution in parallel
   const [caller, initialCfg] = await Promise.all([
     verifyFirebaseIdToken(idToken, env),
     resolveWorkerAiConfig(env)
   ]);
 
   const useServiceAccountCatalog = hasServiceAccountConfig(env);
-  const projectId = (env.FIREBASE_PROJECT_ID || DEFAULT_PROJECT_ID).trim();
-  const hasWarmPublicCatalog = Boolean(
-    publicCatalogCache.get(projectId) &&
-      publicCatalogCache.get(projectId)!.expiresAt > Date.now()
-  );
-
-  // Fetch user profile in parallel with public catalog if Service Account not ready or warm cache missing
   const saTokenPromise = useServiceAccountCatalog
     ? getFirestoreAuthToken(env, undefined, true).catch(() => null)
     : Promise.resolve(null);
@@ -1102,148 +1131,34 @@ async function prepareWorkerChat(
 
   const quota = getWorkerQuota(caller.uid, cfg.AI_RATE_LIMIT_PER_MIN, cfg.AI_RATE_LIMIT_PER_DAY, true);
 
-  const expiryRaw =
-    typeof userProfile?.accessExpiry === 'string'
-      ? userProfile.accessExpiry
-      : typeof userProfile?.accessExpiryAt === 'string'
-        ? userProfile.accessExpiryAt
-        : null;
-  const isExpired = Boolean(
-    userProfile?.subscriptionStatus === 'expired' ||
-      (expiryRaw && !Number.isNaN(new Date(expiryRaw).getTime()) && new Date(expiryRaw).getTime() <= Date.now())
-  );
-  const hasAllAccess = isAdmin || (!isExpired && userProfile?.hasAllAccess === true);
-  const unlockedSet = new Set<string>();
-  if (!isExpired) {
-    const allowed = Array.isArray(userProfile?.allowedCategories) ? userProfile.allowedCategories : [];
-    const assigned = Array.isArray(userProfile?.assignedCourses) ? userProfile.assignedCourses : [];
-    for (const id of [...allowed, ...assigned]) {
-      if (typeof id === 'string' && id.trim()) unlockedSet.add(id.trim());
-    }
-  }
+  const rawName = isOwner
+    ? PLATFORM_OWNER_NAME
+    : (typeof userProfile?.displayName === 'string' && userProfile.displayName.trim()) || 'Student';
+  const viewerFirstName = rawName.split(/\s+/)[0] || 'Student';
+  const viewerRoleLabel = isOwner ? 'owner' : isMasterAdmin ? 'super_admin' : isAdmin ? 'admin' : 'student';
 
-  // Fetch cached catalog (shared 60s TTL; 0 Firestore calls on cache hits)
-  const catalogToken = !isAdmin && saToken ? saToken : caller.idToken;
-  const catalog = await fetchPublicCatalog(
-    env,
-    catalogToken,
-    Boolean(saToken) || isAdmin,
-    isAdmin && !hasWarmPublicCatalog
-  );
-
-  const rawPdfs = await fetchUserPdfsCached(
-    env,
-    caller.uid,
-    caller.idToken,
-    hasAllAccess,
-    unlockedSet,
-    isAdmin || saToken ? catalog.pdfs : undefined
-  );
-
-  const seenCats = new Set<string>();
-  const cleanCats = catalog.cats
-    .filter(c => (isAdmin ? true : c.isActive !== false))
-    .sort((a, b) => Number(a.order ?? 0) - Number(b.order ?? 0))
-    .filter(c => {
-      const key = String(c.slug || c.id || c.name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-      if (!key || seenCats.has(key)) return false;
-      seenCats.add(key);
-      return true;
-    });
-
-  const lastUserTurn = [...cleanHistory].reverse().find(h => h.role === 'user')?.text || '';
-  const tokens = tokenizeQuery(`${cleanMessage} ${lastUserTurn.slice(0, 120)}`);
-
-  const scoredCats = cleanCats.map(c => {
-    const catId = String(c.id || '');
-    const catName = String(c.name || 'Course');
-    const unlocked = hasAllAccess || unlockedSet.has(catId);
-    const catFolders = catalog.folders
-      .filter(f => String(f.categoryId || '') === catId || String(f.parentId || '') === catId)
-      .map(f => String(f.name || '').trim())
-      .filter(Boolean);
-    const catLessons = catalog.videos.filter(
-      v => !UNWANTED_DEMO_VIDEO_IDS.has(String(v.id || '')) && String(v.categoryId || '') === catId && v.isPublished === true
-    );
-    const catPdfs = rawPdfs.filter(
-      p => !UNWANTED_DEMO_PDF_IDS.has(String(p.id || '')) && String(p.categoryId || '') === catId && (isAdmin || p.isPublished === true)
-    );
-
-    const catText = `${catName} ${c.description || ''} ${catFolders.join(' ')} ${catLessons.slice(0, 8).map(v => v.title || '').join(' ')} ${catPdfs.slice(0, 6).map(p => p.title || '').join(' ')}`;
-    const relevance = scoreTextMatch(catText, tokens);
-
-    return {
-      c,
-      catId,
-      catName,
-      unlocked,
-      catFolders,
-      catLessons,
-      catPdfs,
-      relevance
-    };
-  });
-
-  // Pick top 3 relevant (or unlocked) categories for detailed expansion; summarize others in 1 line
-  const detailedIds = new Set(
-    [...scoredCats]
-      .sort((a, b) => {
-        if (b.relevance !== a.relevance) return b.relevance - a.relevance;
-        if (a.unlocked !== b.unlocked) return a.unlocked ? -1 : 1;
-        return Number(a.c.order ?? 0) - Number(b.c.order ?? 0);
-      })
-      .slice(0, 3)
-      .map(x => x.catId)
-  );
-
-  const courseNames: string[] = [];
-  const catalogBlock = scoredCats
-    .map((item, idx) => {
-      courseNames.push(item.catName);
-      const statusTag = item.unlocked ? 'UNLOCKED' : `LOCKED ₹${item.c.price || 299}`;
-      if (!detailedIds.has(item.catId)) {
-        return `${idx + 1}. "${item.catName}" [${statusTag}] — ${item.catLessons.length} lessons${item.catPdfs.length ? `, ${item.catPdfs.length} PDFs` : ''}`;
-      }
-
-      const lessons = [...item.catLessons]
-        .sort((a, b) => {
-          const diff =
-            scoreTextMatch(`${b.title || ''} ${b.folderName || ''}`, tokens) -
-            scoreTextMatch(`${a.title || ''} ${a.folderName || ''}`, tokens);
-          return diff !== 0 ? diff : Number(a.order ?? 0) - Number(b.order ?? 0);
-        })
-        .slice(0, 6)
-        .map(v => `  - ${v.episode ? `[${v.episode}] ` : ''}${v.title}${v.isFreePreview ? ' [FREE]' : ''}`);
-
-      const pdfs = [...item.catPdfs]
-        .sort((a, b) => scoreTextMatch(String(b.title || ''), tokens) - scoreTextMatch(String(a.title || ''), tokens))
-        .slice(0, 5)
-        .map(p => `  - PDF: "${p.title}" (${p.pageCount || 12}p)`);
-
-      const desc = String(item.c.description || '').trim().slice(0, 100);
-      return `${idx + 1}. "${item.catName}" [${statusTag}]${desc ? ` — ${desc}` : ''}${
-        item.catFolders.length ? `\n  Folders: ${item.catFolders.slice(0, 8).join(', ')}` : ''
-      }\n  Lessons:\n${lessons.join('\n') || '  (None)'}${
-        pdfs.length ? `\n  PDFs:\n${pdfs.join('\n')}` : ''
-      }`;
-    })
-    .join('\n');
-
-  const systemInstruction = `You are Skill-Flix AI ("Your Personal Learning Assistant") on Skill-Flix Pro.
-Reply clearly, warmly, and concisely in the student's language (Hindi, Hinglish, or English) using short bullet points or steps.
-Teach video editing (Alight Motion, CapCut, Premiere Pro, After Effects, PDFs, roadmaps, creator tips).
-NEVER invent courses, lessons, or PDFs not in this catalog:
-${catalogBlock || 'No active courses listed yet.'}`;
+  const toolCtx: WorkerToolContext = {
+    env: { ...env, FIREBASE_PROJECT_ID: getProjectId(env) },
+    caller,
+    userProfile,
+    saToken,
+    isOwner,
+    isMasterAdmin,
+    isAdmin,
+    memo: new Map(),
+    knownSecrets: [cfg.GEMINI_API_KEY, altKey].filter(Boolean)
+  };
 
   return {
+    caller,
     cfg,
     isGeminiProvider,
     altKey,
     quota,
-    systemInstruction,
+    toolCtx,
+    systemInstruction: buildWorkerSystemInstruction(viewerFirstName, viewerRoleLabel),
     cleanHistory,
-    cleanMessage,
-    courseNames
+    cleanMessage
   };
 }
 
@@ -1293,34 +1208,41 @@ export async function handleWorkerAiChat(
   body: { message?: unknown; history?: unknown },
   signal?: AbortSignal
 ) {
-  const ctx = await prepareWorkerChat(authHeader, env, body);
+  const ctx = await validateWorkerChatRequest(authHeader, env, body);
 
-  const outcome = ctx.isGeminiProvider
-    ? await generateWithWorkerGemini(
-        ctx.cfg.GEMINI_API_KEY,
-        ctx.cfg.GEMINI_AI_MODEL,
-        ctx.cfg.GEMINI_FALLBACK_MODEL,
-        ctx.systemInstruction,
-        ctx.cleanHistory,
-        ctx.cleanMessage,
-        ctx.quota,
-        signal
-      )
-    : await generateWithWorkerOpenAiProvider(
-        env,
-        ctx.cfg.AI_PROVIDER as 'openrouter' | 'groq',
-        ctx.altKey,
-        ctx.cfg.GEMINI_AI_MODEL,
-        ctx.cfg.GEMINI_FALLBACK_MODEL,
-        ctx.systemInstruction,
-        ctx.cleanHistory,
-        ctx.cleanMessage,
-        ctx.quota,
-        signal
-      );
+  let outcome: { text: string; model: string };
+  if (ctx.isGeminiProvider) {
+    outcome = await generateWithWorkerGemini(
+      ctx.cfg.GEMINI_API_KEY,
+      ctx.cfg.GEMINI_AI_MODEL,
+      ctx.cfg.GEMINI_FALLBACK_MODEL,
+      ctx.systemInstruction,
+      ctx.cleanHistory,
+      ctx.cleanMessage,
+      ctx.quota,
+      ctx.toolCtx,
+      signal
+    );
+  } else {
+    const toolData = await routeAndExecuteWorkerTools(ctx.cleanMessage, ctx.cleanHistory, ctx.toolCtx);
+    const augmented = `${ctx.systemInstruction}\n\nREALTIME_SKILLFLIX_DATA:\n${JSON.stringify(toolData)}`;
+    outcome = await generateWithWorkerOpenAiProvider(
+      env,
+      ctx.cfg.AI_PROVIDER as 'openrouter' | 'groq',
+      ctx.altKey,
+      ctx.cfg.GEMINI_AI_MODEL,
+      ctx.cfg.GEMINI_FALLBACK_MODEL,
+      augmented,
+      ctx.cleanHistory,
+      ctx.cleanMessage,
+      ctx.quota,
+      signal
+    );
+  }
 
+  const courseNames = await getWorkerActiveCourseNames(ctx.toolCtx);
   const lower = outcome.text.toLowerCase();
-  const referencedCourses = ctx.courseNames.filter(name => lower.includes(name.toLowerCase()));
+  const referencedCourses = courseNames.filter(name => lower.includes(name.toLowerCase()));
 
   return {
     reply: outcome.text,
@@ -1339,8 +1261,7 @@ export async function handleWorkerAiChatStream(
   corsHeaders: Record<string, string>,
   requestSignal?: AbortSignal
 ): Promise<Response> {
-  // Run auth, quota & context validation BEFORE opening SSE response so HTTP 400/401/403/429/503 return standard status codes
-  const ctx = await prepareWorkerChat(authHeader, env, body);
+  const ctx = await validateWorkerChatRequest(authHeader, env, body);
   const providerLabel = ctx.isGeminiProvider ? 'Google Gemini API (Free Tier)' : ctx.cfg.AI_PROVIDER;
   const enc = new TextEncoder();
 
@@ -1352,10 +1273,16 @@ export async function handleWorkerAiChatStream(
     requestSignal?.addEventListener('abort', onReqAbort, { once: true });
   }
 
+  let keepaliveTimer: ReturnType<typeof setInterval> | undefined;
+
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       let closed = false;
       const closeStream = () => {
+        if (keepaliveTimer !== undefined) {
+          clearInterval(keepaliveTimer);
+          keepaliveTimer = undefined;
+        }
         if (!closed) {
           closed = true;
           try {
@@ -1369,6 +1296,15 @@ export async function handleWorkerAiChatStream(
       const onStreamAbort = () => closeStream();
       streamAbort.signal.addEventListener('abort', onStreamAbort, { once: true });
 
+      const pushComment = (comment: string) => {
+        if (closed || streamAbort.signal.aborted) return;
+        try {
+          controller.enqueue(enc.encode(`: ${comment}\n\n`));
+        } catch {
+          closed = true;
+        }
+      };
+
       const pushEvent = (event: string, data: unknown) => {
         if (closed || streamAbort.signal.aborted) return;
         try {
@@ -1377,6 +1313,12 @@ export async function handleWorkerAiChatStream(
           closed = true;
         }
       };
+
+      // Flush initial SSE bytes immediately and keep mobile/proxy connection alive while tools + model execute
+      pushComment('connected');
+      keepaliveTimer = setInterval(() => {
+        pushComment('ping');
+      }, 3500);
 
       try {
         const onStartModel = (modelName: string) => {
@@ -1391,36 +1333,43 @@ export async function handleWorkerAiChatStream(
           pushEvent('chunk', { delta });
         };
 
-        const outcome = ctx.isGeminiProvider
-          ? await streamWithWorkerGemini(
-              ctx.cfg.GEMINI_API_KEY,
-              ctx.cfg.GEMINI_AI_MODEL,
-              ctx.cfg.GEMINI_FALLBACK_MODEL,
-              ctx.systemInstruction,
-              ctx.cleanHistory,
-              ctx.cleanMessage,
-              ctx.quota,
-              onStartModel,
-              onDelta,
-              streamAbort.signal
-            )
-          : await streamWithWorkerOpenAiProvider(
-              env,
-              ctx.cfg.AI_PROVIDER as 'openrouter' | 'groq',
-              ctx.altKey,
-              ctx.cfg.GEMINI_AI_MODEL,
-              ctx.cfg.GEMINI_FALLBACK_MODEL,
-              ctx.systemInstruction,
-              ctx.cleanHistory,
-              ctx.cleanMessage,
-              ctx.quota,
-              onStartModel,
-              onDelta,
-              streamAbort.signal
-            );
+        let outcome: { text: string; model: string };
+        if (ctx.isGeminiProvider) {
+          outcome = await streamWithWorkerGemini(
+            ctx.cfg.GEMINI_API_KEY,
+            ctx.cfg.GEMINI_AI_MODEL,
+            ctx.cfg.GEMINI_FALLBACK_MODEL,
+            ctx.systemInstruction,
+            ctx.cleanHistory,
+            ctx.cleanMessage,
+            ctx.quota,
+            ctx.toolCtx,
+            onStartModel,
+            onDelta,
+            streamAbort.signal
+          );
+        } else {
+          const toolData = await routeAndExecuteWorkerTools(ctx.cleanMessage, ctx.cleanHistory, ctx.toolCtx);
+          const augmented = `${ctx.systemInstruction}\n\nREALTIME_SKILLFLIX_DATA:\n${JSON.stringify(toolData)}`;
+          outcome = await streamWithWorkerOpenAiProvider(
+            env,
+            ctx.cfg.AI_PROVIDER as 'openrouter' | 'groq',
+            ctx.altKey,
+            ctx.cfg.GEMINI_AI_MODEL,
+            ctx.cfg.GEMINI_FALLBACK_MODEL,
+            augmented,
+            ctx.cleanHistory,
+            ctx.cleanMessage,
+            ctx.quota,
+            onStartModel,
+            onDelta,
+            streamAbort.signal
+          );
+        }
 
+        const courseNames = await getWorkerActiveCourseNames(ctx.toolCtx);
         const lower = outcome.text.toLowerCase();
-        const referencedCourses = ctx.courseNames.filter(name => lower.includes(name.toLowerCase()));
+        const referencedCourses = courseNames.filter(name => lower.includes(name.toLowerCase()));
 
         pushEvent('done', {
           reply: outcome.text,
@@ -1452,6 +1401,10 @@ export async function handleWorkerAiChatStream(
       }
     },
     cancel() {
+      if (keepaliveTimer !== undefined) {
+        clearInterval(keepaliveTimer);
+        keepaliveTimer = undefined;
+      }
       streamAbort.abort();
       requestSignal?.removeEventListener('abort', onReqAbort);
     }
@@ -1494,7 +1447,9 @@ export async function testWorkerAiConnection(env: WorkerEnv, admin: { idToken: s
         cfg.GEMINI_FALLBACK_MODEL,
         'You are Skill-Flix AI. Reply concisely with "Skill-Flix AI connection verified."',
         [],
-        'Ping'
+        'Ping',
+        undefined,
+        undefined
       );
       return {
         success: true,

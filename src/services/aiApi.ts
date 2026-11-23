@@ -392,11 +392,11 @@ export async function streamSkillFlixAiMessage(params: {
   };
   params.signal?.addEventListener('abort', onExternalAbort, { once: true });
 
-  // Overall ceiling + inactivity watchdog during active streaming
+  // Overall ceiling + inactivity watchdog during active streaming (allows backend primary + fallback failover)
   const totalTimer = setTimeout(() => {
     timedOut = true;
     streamController.abort();
-  }, 40_000);
+  }, 45_000);
 
   let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
   const resetInactivityTimer = () => {
@@ -404,7 +404,7 @@ export async function streamSkillFlixAiMessage(params: {
     inactivityTimer = setTimeout(() => {
       timedOut = true;
       streamController.abort();
-    }, 25_000);
+    }, 32_000);
   };
   resetInactivityTimer();
 

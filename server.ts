@@ -890,6 +890,10 @@ export function createApp() {
             res.setHeader('X-Accel-Buffering', 'no');
             res.flushHeaders?.();
           },
+          onKeepalive: () => {
+            if (res.writableEnded || abortController.signal.aborted) return;
+            res.write(': ping\n\n');
+          },
           sendEvent: (event, data) => {
             if (res.writableEnded || abortController.signal.aborted) return;
             res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);

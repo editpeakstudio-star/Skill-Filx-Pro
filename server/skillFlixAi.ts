@@ -1,10 +1,9 @@
-import { GoogleGenAI, ThinkingLevel } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, type Content, type Part } from '@google/genai';
 import type { AiConnectionTestResult } from '../src/types/index.ts';
 import {
   fetchFirestoreDocument,
   getServerServiceAccountToken,
   hasServerServiceAccount,
-  listFirestoreCollection,
   type VerifiedFirebaseUser
 } from './firebaseAuthVerify.ts';
 import {
@@ -13,27 +12,21 @@ import {
   type ResolvedAiRuntimeConfig
 } from './aiConfigStore.ts';
 import { sanitizeErrorMessage } from './telegramCrypto.ts';
+import {
+  getAllActiveCourseNames,
+  routeAndExecuteToolsForPrompt,
+  runSkillFlixTool,
+  SKILLFLIX_TOOL_DECLARATIONS,
+  type ToolExecutionContext
+} from './skillFlixTools.ts';
 
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'skillflix-academy';
 const PLATFORM_OWNER_EMAIL = 'editpeakstudio@gmail.com';
+const PLATFORM_OWNER_NAME = 'Pintu Kumar';
 
 const MAX_MESSAGE_CHARS = 1500;
 const MAX_HISTORY_TURNS = 6;
-
-const UNWANTED_DEMO_VIDEO_IDS = new Set([
-  'vid_am_vectors',
-  'vid_am_null_rigs',
-  'vid_am_3d_camera',
-  'vid_cap_velocity',
-  'vid_cap_effects',
-  'vid_prem_lumetri',
-  'vid_ae_saber'
-]);
-
-const UNWANTED_DEMO_PDF_IDS = new Set([
-  'pdf_am_cheatsheet',
-  'pdf_cap_curves'
-]);
+const MAX_TOOL_ROUNDS = 2;
 
 export interface AiTurnInput {
   role: 'user' | 'model';
@@ -100,24 +93,8 @@ interface UserProfileCacheEntry {
   expiresAt: number;
 }
 
-interface CatalogCacheEntry {
-  cats: Record<string, unknown>[];
-  folders: Record<string, unknown>[];
-  videos: Record<string, unknown>[];
-  pdfs?: Record<string, unknown>[];
-  expiresAt: number;
-}
-
-interface UserPdfCacheEntry {
-  pdfs: Record<string, unknown>[];
-  expiresAt: number;
-}
-
 const rateBuckets = new Map<string, UserRateBucket>();
 const userProfileCache = new Map<string, UserProfileCacheEntry>();
-const publicCatalogCache = new Map<string, CatalogCacheEntry>();
-const adminCatalogCache = new Map<string, CatalogCacheEntry>();
-const userPdfCache = new Map<string, UserPdfCacheEntry>();
 const geminiClientCache = new Map<string, GoogleGenAI>();
 
 function getGeminiClient(apiKey: string): GoogleGenAI {
@@ -261,48 +238,6 @@ export async function getAsyncAiStatus(): Promise<AiPublicStatus> {
   return getAiStatus();
 }
 
-// ======================================================
-// FIRESTORE STRUCTURED QUERY + CACHING HELPERS
-// ======================================================
-
-type RawFsVal = Record<string, any>;
-
-function decodeFsValue(val: RawFsVal): unknown {
-  if (!val || typeof val !== 'object') return undefined;
-  if ('stringValue' in val) return val.stringValue;
-  if ('integerValue' in val) return Number(val.integerValue);
-  if ('doubleValue' in val) return Number(val.doubleValue);
-  if ('booleanValue' in val) return val.booleanValue;
-  if ('nullValue' in val) return null;
-  if ('timestampValue' in val) return val.timestampValue;
-  if ('arrayValue' in val) {
-    return Array.isArray(val.arrayValue?.values) ? val.arrayValue.values.map(decodeFsValue) : [];
-  }
-  if ('mapValue' in val) {
-    const out: Record<string, unknown> = {};
-    const fields = val.mapValue?.fields || {};
-    for (const [k, v] of Object.entries(fields)) {
-      out[k] = decodeFsValue(v as RawFsVal);
-    }
-    return out;
-  }
-  return undefined;
-}
-
-function decodeFsDoc(docJson: { name?: string; fields?: Record<string, RawFsVal> }): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  if (docJson.name) {
-    const parts = docJson.name.split('/');
-    out.id = parts[parts.length - 1];
-  }
-  if (docJson.fields) {
-    for (const [k, v] of Object.entries(docJson.fields)) {
-      out[k] = decodeFsValue(v);
-    }
-  }
-  return out;
-}
-
 async function fetchAiWithTimeout(
   url: string,
   init: RequestInit = {},
@@ -345,88 +280,6 @@ async function fetchAiWithTimeout(
   }
 }
 
-async function runFirestoreQuery(
-  structuredQuery: Record<string, unknown>,
-  idToken: string
-): Promise<Record<string, unknown>[]> {
-  const url = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents:runQuery`;
-  const res = await fetchAiWithTimeout(
-    url,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${idToken}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json'
-      },
-      body: JSON.stringify({ structuredQuery })
-    },
-    8000
-  );
-
-  if (!res.ok) {
-    const errText = await res.text().catch(() => '');
-    throw new Error(`Firestore query error (${res.status}): ${errText.slice(0, 160)}`);
-  }
-
-  const rows = (await res.json()) as Array<{ document?: { name?: string; fields?: Record<string, RawFsVal> } }>;
-  const docs: Record<string, unknown>[] = [];
-  for (const row of rows) {
-    if (row.document) {
-      docs.push(decodeFsDoc(row.document));
-    }
-  }
-  return docs;
-}
-
-interface SkillFlixKnowledgeContext {
-  viewerRole: 'owner' | 'admin' | 'student';
-  viewerFirstName: string;
-  hasAllAccess: boolean;
-  unlockedCategoryIds: string[];
-  allCourseNames: string[];
-  categories: Array<{
-    id: string;
-    name: string;
-    description: string;
-    price: number;
-    unlocked: boolean;
-    lessonCount: number;
-    pdfCount: number;
-    detailed: boolean;
-    folders: string[];
-    lessons: Array<{
-      title: string;
-      episode: string;
-      folderName: string;
-      isFreePreview: boolean;
-    }>;
-    pdfs: Array<{
-      title: string;
-      pageCount: number;
-    }>;
-  }>;
-}
-
-function tokenizeQuery(input: string): string[] {
-  return input
-    .toLowerCase()
-    .replace(/[^a-z0-9\u0900-\u097f]+/gi, ' ')
-    .split(/\s+/)
-    .map(t => t.trim())
-    .filter(t => t.length >= 2);
-}
-
-function scoreMatch(haystack: string, tokens: string[]): number {
-  if (!tokens.length) return 0;
-  const lower = haystack.toLowerCase();
-  let score = 0;
-  for (const tok of tokens) {
-    if (lower.includes(tok)) score += 1;
-  }
-  return score;
-}
-
 async function fetchCachedUserProfile(uid: string, idToken: string): Promise<Record<string, unknown> | null> {
   const now = Date.now();
   const cached = userProfileCache.get(uid);
@@ -436,397 +289,23 @@ async function fetchCachedUserProfile(uid: string, idToken: string): Promise<Rec
 
   const profile = await fetchFirestoreDocument('users', uid, idToken).catch(() => null);
   if (userProfileCache.size > 300) userProfileCache.clear();
-  userProfileCache.set(uid, { profile, expiresAt: now + 15_000 });
+  // Short 5s cache so real-time unlocks/expiries reflect immediately while preventing duplicate hits
+  userProfileCache.set(uid, { profile, expiresAt: now + 5_000 });
   return profile;
 }
 
-async function fetchCachedCatalog(
-  token: string,
-  includePdfs: boolean,
-  isAdmin: boolean
-): Promise<CatalogCacheEntry> {
-  const now = Date.now();
-  const cacheMap = isAdmin ? adminCatalogCache : publicCatalogCache;
-  const cached = cacheMap.get(FIREBASE_PROJECT_ID);
-  if (cached && cached.expiresAt > now && (!includePdfs || cached.pdfs !== undefined)) {
-    return cached;
-  }
-
-  const [cats, folders, videos, pdfs] = await Promise.all([
-    isAdmin
-      ? listFirestoreCollection('categories', token).catch(() => [])
-      : runFirestoreQuery(
-          {
-            from: [{ collectionId: 'categories' }],
-            where: {
-              fieldFilter: {
-                field: { fieldPath: 'isActive' },
-                op: 'EQUAL',
-                value: { booleanValue: true }
-              }
-            },
-            limit: 100
-          },
-          token
-        ).catch(() => []),
-    listFirestoreCollection('folders', token).catch(() => []),
-    runFirestoreQuery(
-      {
-        from: [{ collectionId: 'videoCatalog' }],
-        where: {
-          fieldFilter: {
-            field: { fieldPath: 'isPublished' },
-            op: 'EQUAL',
-            value: { booleanValue: true }
-          }
-        },
-        limit: 250
-      },
-      token
-    ).catch(() => []),
-    includePdfs
-      ? (isAdmin
-          ? listFirestoreCollection('pdfs', token).catch(() => [])
-          : runFirestoreQuery(
-              {
-                from: [{ collectionId: 'pdfs' }],
-                where: {
-                  fieldFilter: {
-                    field: { fieldPath: 'isPublished' },
-                    op: 'EQUAL',
-                    value: { booleanValue: true }
-                  }
-                },
-                limit: 200
-              },
-              token
-            ).catch(() => []))
-      : Promise.resolve(undefined)
-  ]);
-
-  const entry: CatalogCacheEntry = {
-    cats,
-    folders,
-    videos,
-    pdfs,
-    expiresAt: now + 60_000
-  };
-  cacheMap.set(FIREBASE_PROJECT_ID, entry);
-  return entry;
-}
-
-async function fetchCachedUserPdfs(
-  uid: string,
-  idToken: string,
-  hasAllAccess: boolean,
-  unlockedSet: Set<string>,
-  sharedPdfs?: Record<string, unknown>[]
-): Promise<Record<string, unknown>[]> {
-  if (sharedPdfs) {
-    if (hasAllAccess) return sharedPdfs;
-    if (unlockedSet.size === 0) return [];
-    return sharedPdfs.filter(p => unlockedSet.has(String(p.categoryId || '')));
-  }
-
-  if (!hasAllAccess && unlockedSet.size === 0) return [];
-
-  const key = `${uid}:${hasAllAccess ? '1' : '0'}:${Array.from(unlockedSet).sort().join(',')}`;
-  const now = Date.now();
-  const cached = userPdfCache.get(key);
-  if (cached && cached.expiresAt > now) {
-    return cached.pdfs;
-  }
-
-  let rawPdfs: Record<string, unknown>[] = [];
-  if (hasAllAccess) {
-    rawPdfs = await runFirestoreQuery(
-      {
-        from: [{ collectionId: 'pdfs' }],
-        where: {
-          fieldFilter: {
-            field: { fieldPath: 'isPublished' },
-            op: 'EQUAL',
-            value: { booleanValue: true }
-          }
-        },
-        limit: 200
-      },
-      idToken
-    ).catch(() => []);
-  } else {
-    const perCatPdfs = await Promise.all(
-      Array.from(unlockedSet).slice(0, 20).map(catId =>
-        runFirestoreQuery(
-          {
-            from: [{ collectionId: 'pdfs' }],
-            where: {
-              compositeFilter: {
-                op: 'AND',
-                filters: [
-                  {
-                    fieldFilter: {
-                      field: { fieldPath: 'isPublished' },
-                      op: 'EQUAL',
-                      value: { booleanValue: true }
-                    }
-                  },
-                  {
-                    fieldFilter: {
-                      field: { fieldPath: 'categoryId' },
-                      op: 'EQUAL',
-                      value: { stringValue: catId }
-                    }
-                  }
-                ]
-              }
-            },
-            limit: 60
-          },
-          idToken
-        ).catch(() => [])
-      )
-    );
-    rawPdfs = perCatPdfs.flat();
-  }
-
-  if (userPdfCache.size > 300) userPdfCache.clear();
-  userPdfCache.set(key, { pdfs: rawPdfs, expiresAt: now + 30_000 });
-  return rawPdfs;
-}
-
-async function retrieveSkillFlixKnowledge(
-  caller: VerifiedFirebaseUser,
-  userQuestion: string,
-  preFetchedUserProfile?: Record<string, unknown> | null,
-  preFetchedSaToken?: string | null
-): Promise<SkillFlixKnowledgeContext> {
-  const userProfile =
-    preFetchedUserProfile !== undefined
-      ? preFetchedUserProfile
-      : await fetchCachedUserProfile(caller.uid, caller.idToken);
-
-  const isOwner = caller.email.toLowerCase() === PLATFORM_OWNER_EMAIL && caller.emailVerified;
-  if (
-    userProfile &&
-    (userProfile.isSuspended === true || userProfile.accountStatus === 'suspended') &&
-    !isOwner
-  ) {
-    throw new AiServiceError(
-      403,
-      'ACCOUNT_SUSPENDED',
-      'Your Skill-Flix account is currently suspended. Contact support for help.'
-    );
-  }
-
-  const rawRole = typeof userProfile?.role === 'string' ? userProfile.role : 'user';
-  const isAdmin = isOwner || rawRole === 'master_admin' || rawRole === 'admin';
-
-  const expiryRaw =
-    typeof userProfile?.accessExpiry === 'string'
-      ? userProfile.accessExpiry
-      : typeof userProfile?.accessExpiryAt === 'string'
-        ? userProfile.accessExpiryAt
-        : null;
-  const isExpired = Boolean(
-    userProfile?.subscriptionStatus === 'expired' ||
-      (expiryRaw && !Number.isNaN(new Date(expiryRaw).getTime()) && new Date(expiryRaw).getTime() <= Date.now())
-  );
-
-  const hasAllAccess = isAdmin || (!isExpired && userProfile?.hasAllAccess === true);
-  const unlockedSet = new Set<string>();
-  if (!isExpired) {
-    const allowed = Array.isArray(userProfile?.allowedCategories) ? userProfile.allowedCategories : [];
-    const assigned = Array.isArray(userProfile?.assignedCourses) ? userProfile.assignedCourses : [];
-    for (const id of [...allowed, ...assigned]) {
-      if (typeof id === 'string' && id.trim()) unlockedSet.add(id.trim());
-    }
-  }
-  const unlockedCategoryIds = Array.from(unlockedSet);
-
-  const saToken =
-    preFetchedSaToken !== undefined
-      ? preFetchedSaToken
-      : hasServerServiceAccount()
-        ? await getServerServiceAccountToken().catch(() => null)
-        : null;
-  const hasWarmPublic = Boolean(
-    publicCatalogCache.get(FIREBASE_PROJECT_ID) &&
-      publicCatalogCache.get(FIREBASE_PROJECT_ID)!.expiresAt > Date.now()
-  );
-
-  const catalogToken = !isAdmin && saToken ? saToken : caller.idToken;
-  const catalog = await fetchCachedCatalog(
-    catalogToken,
-    Boolean(saToken) || isAdmin,
-    isAdmin && !hasWarmPublic
-  );
-
-  const rawPdfs = await fetchCachedUserPdfs(
-    caller.uid,
-    caller.idToken,
-    hasAllAccess,
-    unlockedSet,
-    isAdmin || saToken ? catalog.pdfs : undefined
-  );
-
-  const seenCatKeys = new Set<string>();
-  const cleanCategories = catalog.cats
-    .filter(c => (isAdmin ? true : c.isActive !== false))
-    .sort((a, b) => Number(a.order ?? 0) - Number(b.order ?? 0))
-    .filter(c => {
-      const slug = String(c.slug || c.id || c.name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-      if (!slug || seenCatKeys.has(slug)) return false;
-      seenCatKeys.add(slug);
-      return true;
-    });
-
-  const tokens = tokenizeQuery(userQuestion);
-
-  const scoredCats = cleanCategories.map(cat => {
-    const catId = String(cat.id || '');
-    const catName = String(cat.name || 'Course');
-    const unlocked = hasAllAccess || unlockedSet.has(catId);
-
-    const catFolders = catalog.folders
-      .filter(f => String(f.categoryId || '') === catId || String(f.parentId || '') === catId)
-      .sort((a, b) => Number(a.order ?? 0) - Number(b.order ?? 0))
-      .map(f => String(f.name || '').trim())
-      .filter(Boolean);
-
-    const catLessons = catalog.videos.filter(v => {
-      const vid = String(v.id || '');
-      if (!vid || UNWANTED_DEMO_VIDEO_IDS.has(vid)) return false;
-      if (String(v.categoryId || '') !== catId) return false;
-      return v.isPublished === true;
-    });
-
-    const catPdfs = rawPdfs.filter(p => {
-      const pid = String(p.id || '');
-      if (!pid || UNWANTED_DEMO_PDF_IDS.has(pid)) return false;
-      if (String(p.categoryId || '') !== catId) return false;
-      return isAdmin || p.isPublished === true;
-    });
-
-    const catText = `${catName} ${cat.description || ''} ${catFolders.join(' ')} ${catLessons.slice(0, 8).map(v => v.title || '').join(' ')} ${catPdfs.slice(0, 6).map(p => p.title || '').join(' ')}`;
-    const relevance = scoreMatch(catText, tokens);
-
-    return {
-      cat,
-      catId,
-      catName,
-      unlocked,
-      catFolders,
-      catLessons,
-      catPdfs,
-      relevance
-    };
-  });
-
-  // Expand full lesson/PDF details only for top 3 relevant/unlocked courses to keep prompt crisp & TTFT fast
-  const detailedIds = new Set(
-    [...scoredCats]
-      .sort((a, b) => {
-        if (b.relevance !== a.relevance) return b.relevance - a.relevance;
-        if (a.unlocked !== b.unlocked) return a.unlocked ? -1 : 1;
-        return Number(a.cat.order ?? 0) - Number(b.cat.order ?? 0);
-      })
-      .slice(0, 3)
-      .map(x => x.catId)
-  );
-
-  const builtCategories = scoredCats.map(item => {
-    const detailed = detailedIds.has(item.catId);
-    const lessons = detailed
-      ? [...item.catLessons]
-          .sort((a, b) => {
-            const scoreDiff =
-              scoreMatch(`${b.title || ''} ${b.folderName || ''}`, tokens) -
-              scoreMatch(`${a.title || ''} ${a.folderName || ''}`, tokens);
-            if (scoreDiff !== 0) return scoreDiff;
-            return Number(a.order ?? 0) - Number(b.order ?? 0);
-          })
-          .slice(0, 6)
-          .map(v => ({
-            title: String(v.title || '').trim(),
-            episode: String(v.episode || '').trim(),
-            folderName: String(v.folderName || '').trim(),
-            isFreePreview: v.isFreePreview === true
-          }))
-      : [];
-
-    const pdfs = detailed
-      ? [...item.catPdfs]
-          .sort((a, b) => scoreMatch(`${b.title || ''}`, tokens) - scoreMatch(`${a.title || ''}`, tokens))
-          .slice(0, 5)
-          .map(p => ({
-            title: String(p.title || '').trim(),
-            pageCount: Number(p.pageCount || 0)
-          }))
-      : [];
-
-    return {
-      id: item.catId,
-      name: item.catName,
-      description: String(item.cat.description || '').trim().slice(0, 100),
-      price: Number(item.cat.price || 299),
-      unlocked: item.unlocked,
-      lessonCount: item.catLessons.length,
-      pdfCount: item.catPdfs.length,
-      detailed,
-      folders: item.catFolders.slice(0, 8),
-      lessons,
-      pdfs
-    };
-  });
-
-  const rawName =
-    (typeof userProfile?.displayName === 'string' && userProfile.displayName.trim()) ||
-    caller.name ||
-    'Student';
-  const viewerFirstName = rawName.split(/\s+/)[0] || 'Student';
-
-  return {
-    viewerRole: isOwner ? 'owner' : isAdmin ? 'admin' : 'student',
-    viewerFirstName,
-    hasAllAccess,
-    unlockedCategoryIds,
-    allCourseNames: builtCategories.map(c => c.name),
-    categories: builtCategories
-  };
-}
-
-function buildSystemInstruction(kb: SkillFlixKnowledgeContext): string {
-  const catalogSummary = kb.categories.length
-    ? kb.categories
-        .map((c, idx) => {
-          const accessLabel = c.unlocked ? 'UNLOCKED' : `LOCKED ₹${c.price}`;
-          if (!c.detailed) {
-            return `${idx + 1}. "${c.name}" [${accessLabel}] — ${c.lessonCount} lessons${c.pdfCount ? `, ${c.pdfCount} PDFs` : ''}`;
-          }
-          const lessonLines = c.lessons.length
-            ? c.lessons
-                .map(
-                  l =>
-                    `  - ${l.episode ? `[${l.episode}] ` : ''}${l.title}${l.isFreePreview ? ' [FREE]' : ''}${l.folderName ? ` (${l.folderName})` : ''}`
-                )
-                .join('\n')
-            : '  (No published lessons yet)';
-          const pdfLines = c.pdfs.length
-            ? c.pdfs.map(p => `  - PDF: "${p.title}" (${p.pageCount || 12}p)`).join('\n')
-            : '';
-          return `${idx + 1}. "${c.name}" [${accessLabel}]${c.description ? ` — ${c.description}` : ''}${
-            c.folders.length ? `\n  Folders: ${c.folders.join(', ')}` : ''
-          }\n  Lessons:\n${lessonLines}${pdfLines ? `\n  PDFs:\n${pdfLines}` : ''}`;
-        })
-        .join('\n')
-    : 'No active courses listed yet.';
-
+function buildSmartSystemInstruction(viewerFirstName: string, viewerRole: string): string {
   return `You are **Skill-Flix AI** ("Your Personal Learning Assistant") on Skill-Flix Pro.
-Reply naturally in Hindi, Hinglish, or English matching the student (${kb.viewerFirstName}, role: ${kb.viewerRole}). Use clear bullets or numbered steps.
-Teach video editing (Alight Motion, CapCut, Premiere Pro, After Effects), guide beginner roadmaps & creator tips.
-STRICT RULES: Never invent courses/lessons/PDFs outside this catalog, respect LOCKED courses, never expose secrets/UIDs.
-CATALOG:
-${catalogSummary}`;
+Language: Reply naturally in Hindi, Hinglish, or English matching the user's language and tone. Use clear bullet points or numbered steps when listing items.
+Capabilities & Real-Time Grounding:
+- You assist students with Skill-Flix courses, video editing (Alight Motion, CapCut, Premiere Pro, After Effects), live website catalog/counts/prices, personal student access/subscriptions, leadership hierarchy, and public support channels.
+- ALWAYS call the provided Skill-Flix tools to retrieve current numbers, prices, courses, PDF counts, personal unlock/expiry status, payment history, public support channels, and Owner/Admin directory. NEVER guess or invent counts, prices, or unlock statuses.
+Security & Privacy Rules (STRICT):
+- Account tools check ONLY the currently signed-in authenticated account. If a user asks for another student's account, another UID, or another email (e.g. checking a different user's courses or purchases), politely decline and explain you can only check their own signed-in account.
+- If a user asks for admin-only financial analytics (total sales/revenue), customer lists, other users' UTRs, audit logs, API keys, or private admin emails/phone numbers, politely decline.
+- Never output raw videoUrl, pdfUrl, UIDs, or private staff contact details.
+- If subscriptionStatus is "expired" or isExpired is true, clearly state that their subscription/access has expired and guide them to renew.
+Current user: ${viewerFirstName} (role: ${viewerRole}).`;
 }
 
 function classifyUpstreamGeminiError(
@@ -935,6 +414,14 @@ function getThinkingConfig(modelName: string) {
   };
 }
 
+function extractPartsText(parts?: Part[]): string {
+  if (!Array.isArray(parts)) return '';
+  return parts
+    .filter(p => !p.thought && typeof p.text === 'string' && p.text.length > 0)
+    .map(p => p.text!)
+    .join('');
+}
+
 async function generateWithGeminiSdk(
   apiKey: string,
   primaryModel: string,
@@ -943,16 +430,18 @@ async function generateWithGeminiSdk(
   history: AiTurnInput[],
   userMessage: string,
   quota: AiQuotaSnapshot,
-  externalSignal?: AbortSignal
+  toolCtx?: ToolExecutionContext,
+  externalSignal?: AbortSignal,
+  customPrimaryTimeoutMs?: number
 ): Promise<{ text: string; model: string }> {
   const ai = getGeminiClient(apiKey);
-  const contents = [
+  const baseContents: Content[] = [
     ...history.map(turn => ({
       role: turn.role,
       parts: [{ text: turn.text }]
     })),
     {
-      role: 'user' as const,
+      role: 'user',
       parts: [{ text: userMessage }]
     }
   ];
@@ -960,78 +449,100 @@ async function generateWithGeminiSdk(
   const modelsToTry = Array.from(new Set([primaryModel, fallbackModel].filter(Boolean)));
   let lastError: any = null;
 
-  for (const modelName of modelsToTry) {
+  for (let mIdx = 0; mIdx < modelsToTry.length; mIdx++) {
+    const modelName = modelsToTry[mIdx];
+    const hasMoreModels = mIdx < modelsToTry.length - 1;
+    const timeoutMs = hasMoreModels
+      ? (customPrimaryTimeoutMs ?? 12_000)
+      : (customPrimaryTimeoutMs ?? 18_000);
     const thinkingConfig = getThinkingConfig(modelName);
-    for (let attempt = 0; attempt < 2; attempt++) {
-      if (externalSignal?.aborted) {
-        throw new AiServiceError(499, 'AI_CANCELLED', 'AI request was cancelled.');
-      }
-      const controller = new AbortController();
-      let timedOut = false;
-      const onExtAbort = () => controller.abort();
-      externalSignal?.addEventListener('abort', onExtAbort, { once: true });
-      const timer = setTimeout(() => {
-        timedOut = true;
-        controller.abort();
-      }, 25_000);
+    const tools = toolCtx ? [{ functionDeclarations: SKILLFLIX_TOOL_DECLARATIONS }] : undefined;
 
-      try {
+    if (externalSignal?.aborted) {
+      throw new AiServiceError(499, 'AI_CANCELLED', 'AI request was cancelled.');
+    }
+
+    const controller = new AbortController();
+    let timedOut = false;
+    const onExtAbort = () => controller.abort();
+    externalSignal?.addEventListener('abort', onExtAbort, { once: true });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+
+    try {
+      let contents: Content[] = [...baseContents];
+      let finalText = '';
+
+      for (let round = 0; round <= (toolCtx ? MAX_TOOL_ROUNDS : 0); round++) {
+        const allowToolsThisRound = Boolean(toolCtx && round < MAX_TOOL_ROUNDS);
         const response = await ai.models.generateContent({
           model: modelName,
           contents,
           config: {
             systemInstruction,
             abortSignal: controller.signal,
+            ...(allowToolsThisRound && tools ? { tools } : {}),
             ...(thinkingConfig ? { thinkingConfig } : {})
           }
         });
-        const text = (response.text || '').trim();
-        if (!text) {
-          throw new Error('Empty response received from Gemini model.');
-        }
-        return { text, model: modelName };
-      } catch (err: any) {
-        if (externalSignal?.aborted && !timedOut) {
-          throw new AiServiceError(499, 'AI_CANCELLED', 'AI request was cancelled.');
-        }
-        lastError = err;
-        const msgUpper = String(err?.message || '').toUpperCase();
-        const status = Number(err?.status || err?.code || 0);
-        const isAuthOrKeyInvalid =
-          status === 401 ||
-          status === 403 ||
-          (status === 400 && (msgUpper.includes('API_KEY') || msgUpper.includes('KEY_INVALID')));
-        const isQuotaOrModelMissing =
-          status === 429 ||
-          status === 404 ||
-          msgUpper.includes('RESOURCE_EXHAUSTED') ||
-          msgUpper.includes('QUOTA') ||
-          msgUpper.includes('NOT_FOUND');
-        const isTransient =
-          err?.name === 'AbortError' ||
-          status === 408 ||
-          status === 500 ||
-          status === 502 ||
-          status === 503 ||
-          status === 504 ||
-          msgUpper.includes('UNAVAILABLE') ||
-          msgUpper.includes('TIMEOUT');
 
-        if (isAuthOrKeyInvalid) {
-          throw classifyUpstreamGeminiError(err, quota, [apiKey]);
-        }
-        if (isQuotaOrModelMissing) {
-          break;
-        }
-        if (isTransient && attempt === 0) {
-          await new Promise(resolve => setTimeout(resolve, 250));
+        const candidateContent = response.candidates?.[0]?.content;
+        const calls = response.functionCalls;
+
+        if (allowToolsThisRound && toolCtx && Array.isArray(calls) && calls.length > 0 && candidateContent) {
+          const toolResults = await Promise.all(
+            calls.map(call => runSkillFlixTool(call.name || '', call.args, toolCtx))
+          );
+
+          const responseParts: Part[] = calls.map((call, idx) => {
+            const res = toolResults[idx];
+            return {
+              functionResponse: {
+                ...(call.id ? { id: call.id } : {}),
+                name: call.name || 'unknown',
+                response:
+                  res.status === 'ok'
+                    ? { output: res.data || {} }
+                    : { error: res.error || 'Tool unavailable' }
+              }
+            };
+          });
+
+          contents = [
+            ...contents,
+            candidateContent,
+            { role: 'user', parts: responseParts }
+          ];
           continue;
         }
+
+        finalText = extractPartsText(candidateContent?.parts).trim() || (response.text || '').trim();
         break;
-      } finally {
-        clearTimeout(timer);
-        externalSignal?.removeEventListener('abort', onExtAbort);
       }
+
+      if (!finalText) {
+        throw new Error('Empty response received from Gemini model.');
+      }
+      return { text: finalText, model: modelName };
+    } catch (err: any) {
+      if (externalSignal?.aborted && !timedOut) {
+        throw new AiServiceError(499, 'AI_CANCELLED', 'AI request was cancelled.');
+      }
+      lastError = err;
+      const msgUpper = String(err?.message || '').toUpperCase();
+      const status = Number(err?.status || err?.code || 0);
+      const isAuthOrKeyInvalid =
+        status === 401 ||
+        status === 403 ||
+        (status === 400 && (msgUpper.includes('API_KEY') || msgUpper.includes('KEY_INVALID')));
+      if (isAuthOrKeyInvalid) {
+        throw classifyUpstreamGeminiError(err, quota, [apiKey]);
+      }
+    } finally {
+      clearTimeout(timer);
+      externalSignal?.removeEventListener('abort', onExtAbort);
     }
   }
 
@@ -1046,27 +557,35 @@ async function streamWithGeminiSdk(
   history: AiTurnInput[],
   userMessage: string,
   quota: AiQuotaSnapshot,
+  toolCtx: ToolExecutionContext,
   onStartModel: (modelName: string) => void,
   onDelta: (delta: string) => void,
   externalSignal?: AbortSignal
 ): Promise<{ text: string; model: string }> {
   const ai = getGeminiClient(apiKey);
-  const contents = [
+  const baseContents: Content[] = [
     ...history.map(turn => ({
       role: turn.role,
       parts: [{ text: turn.text }]
     })),
     {
-      role: 'user' as const,
+      role: 'user',
       parts: [{ text: userMessage }]
     }
   ];
 
   const modelsToTry = Array.from(new Set([primaryModel, fallbackModel].filter(Boolean)));
   let lastError: any = null;
+  let anyEmittedAcrossModels = false;
 
-  for (const modelName of modelsToTry) {
+  for (let mIdx = 0; mIdx < modelsToTry.length; mIdx++) {
+    const modelName = modelsToTry[mIdx];
+    const hasMoreModels = mIdx < modelsToTry.length - 1;
+    const firstTokenTimeoutMs = hasMoreModels ? 12_000 : 18_000;
+    const chunkIdleTimeoutMs = 15_000;
     const thinkingConfig = getThinkingConfig(modelName);
+    const tools = [{ functionDeclarations: SKILLFLIX_TOOL_DECLARATIONS }];
+
     if (externalSignal?.aborted) {
       throw new AiServiceError(499, 'AI_CANCELLED', 'AI request was cancelled.');
     }
@@ -1075,42 +594,108 @@ async function streamWithGeminiSdk(
     let timedOut = false;
     const onExtAbort = () => controller.abort();
     externalSignal?.addEventListener('abort', onExtAbort, { once: true });
-    const timer = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, 28_000);
+
+    let chunkTimer: ReturnType<typeof setTimeout> | undefined;
+    const armTimer = (ms: number) => {
+      if (chunkTimer !== undefined) clearTimeout(chunkTimer);
+      chunkTimer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, ms);
+    };
+    armTimer(firstTokenTimeoutMs);
 
     let emitted = false;
+    let startedMeta = false;
     let accumulated = '';
+
     try {
-      const responseStream = await ai.models.generateContentStream({
-        model: modelName,
-        contents,
-        config: {
-          systemInstruction,
-          abortSignal: controller.signal,
-          ...(thinkingConfig ? { thinkingConfig } : {})
-        }
-      });
+      let contents: Content[] = [...baseContents];
 
-      onStartModel(modelName);
-      for await (const chunk of responseStream) {
-        if (externalSignal?.aborted && !timedOut) {
-          throw new AiServiceError(499, 'AI_CANCELLED', 'AI request was cancelled.');
-        }
-        const chunkText = chunk?.text || '';
-        if (chunkText) {
-          emitted = true;
-          accumulated += chunkText;
-          onDelta(chunkText);
-        }
-      }
+      for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
+        const allowToolsThisRound = round < MAX_TOOL_ROUNDS;
+        armTimer(firstTokenTimeoutMs);
 
-      const finalText = accumulated.trim();
-      if (finalText) {
-        return { text: finalText, model: modelName };
+        const responseStream = await ai.models.generateContentStream({
+          model: modelName,
+          contents,
+          config: {
+            systemInstruction,
+            abortSignal: controller.signal,
+            ...(allowToolsThisRound ? { tools } : {}),
+            ...(thinkingConfig ? { thinkingConfig } : {})
+          }
+        });
+
+        const collectedParts: Part[] = [];
+        const collectedCalls: Array<{ id?: string; name?: string; args?: Record<string, unknown> }> = [];
+        let roundText = '';
+
+        for await (const chunk of responseStream) {
+          if (externalSignal?.aborted && !timedOut) {
+            throw new AiServiceError(499, 'AI_CANCELLED', 'AI request was cancelled.');
+          }
+          armTimer(chunkIdleTimeoutMs);
+
+          const parts = chunk?.candidates?.[0]?.content?.parts || [];
+          for (const part of parts) {
+            if (part && Object.keys(part).length > 0) {
+              collectedParts.push(part);
+            }
+            if (part.functionCall) {
+              collectedCalls.push({
+                id: part.functionCall.id,
+                name: part.functionCall.name,
+                args: (part.functionCall.args || {}) as Record<string, unknown>
+              });
+            } else if (!part.thought && typeof part.text === 'string' && part.text.length > 0) {
+              if (!startedMeta) {
+                startedMeta = true;
+                onStartModel(modelName);
+              }
+              emitted = true;
+              anyEmittedAcrossModels = true;
+              roundText += part.text;
+              accumulated += part.text;
+              onDelta(part.text);
+            }
+          }
+        }
+
+        if (allowToolsThisRound && collectedCalls.length > 0 && !emitted) {
+          const toolResults = await Promise.all(
+            collectedCalls.map(call => runSkillFlixTool(call.name || '', call.args, toolCtx))
+          );
+
+          const responseParts: Part[] = collectedCalls.map((call, idx) => {
+            const res = toolResults[idx];
+            return {
+              functionResponse: {
+                ...(call.id ? { id: call.id } : {}),
+                name: call.name || 'unknown',
+                response:
+                  res.status === 'ok'
+                    ? { output: res.data || {} }
+                    : { error: res.error || 'Tool unavailable' }
+              }
+            };
+          });
+
+          contents = [
+            ...contents,
+            { role: 'model', parts: collectedParts },
+            { role: 'user', parts: responseParts }
+          ];
+          continue;
+        }
+
+        const finalText = (accumulated || roundText).trim();
+        if (finalText) {
+          return { text: finalText, model: modelName };
+        }
+        lastError = new Error('Empty streaming response from Gemini model.');
+        break;
       }
-      lastError = new Error('Empty streaming response from Gemini model.');
     } catch (err: any) {
       if (externalSignal?.aborted && !timedOut) {
         throw new AiServiceError(499, 'AI_CANCELLED', 'AI request was cancelled.');
@@ -1128,10 +713,33 @@ async function streamWithGeminiSdk(
       if (isAuthOrKeyInvalid) {
         throw classifyUpstreamGeminiError(err, quota, [apiKey]);
       }
-      // Try fallback model seamlessly
     } finally {
-      clearTimeout(timer);
+      if (chunkTimer !== undefined) clearTimeout(chunkTimer);
       externalSignal?.removeEventListener('abort', onExtAbort);
+    }
+  }
+
+  // Last-resort fast non-stream backup with full tool calling
+  const fastModel = fallbackModel || primaryModel;
+  if (!anyEmittedAcrossModels && fastModel && !externalSignal?.aborted) {
+    try {
+      const backup = await generateWithGeminiSdk(
+        apiKey,
+        fastModel,
+        '',
+        systemInstruction,
+        history,
+        userMessage,
+        quota,
+        toolCtx,
+        externalSignal,
+        12_000
+      );
+      onStartModel(backup.model);
+      onDelta(backup.text);
+      return backup;
+    } catch {
+      // Fall through to classified error
     }
   }
 
@@ -1482,13 +1090,13 @@ interface PreparedExpressChat {
   geminiKey: string;
   altProviderKey: string;
   quota: AiQuotaSnapshot;
-  kb: SkillFlixKnowledgeContext;
+  toolCtx: ToolExecutionContext;
   systemInstruction: string;
   cleanHistory: AiTurnInput[];
   cleanMessage: string;
 }
 
-async function prepareExpressChat(
+async function prepareExpressValidation(
   caller: VerifiedFirebaseUser,
   body: AiChatRequestBody
 ): Promise<PreparedExpressChat> {
@@ -1506,12 +1114,28 @@ async function prepareExpressChat(
 
   const cleanHistory = pruneHistory(body?.history);
 
-  // Parallelize config sync + user profile + service account token
   const [, userProfile, saToken] = await Promise.all([
     hydrateAiConfigFromFirestore(),
     fetchCachedUserProfile(caller.uid, caller.idToken),
     hasServerServiceAccount() ? getServerServiceAccountToken().catch(() => null) : Promise.resolve(null)
   ]);
+
+  const isOwner = caller.email.toLowerCase() === PLATFORM_OWNER_EMAIL && caller.emailVerified;
+  if (
+    userProfile &&
+    (userProfile.isSuspended === true || userProfile.accountStatus === 'suspended') &&
+    !isOwner
+  ) {
+    throw new AiServiceError(
+      403,
+      'ACCOUNT_SUSPENDED',
+      'Your Skill-Flix account is currently suspended. Contact support for help.'
+    );
+  }
+
+  const rawRole = typeof userProfile?.role === 'string' ? userProfile.role : 'user';
+  const isMasterAdmin = isOwner || rawRole === 'master_admin';
+  const isAdmin = isMasterAdmin || rawRole === 'admin';
 
   const cfg = getResolvedRuntimeAiConfig();
   const altProviderKey =
@@ -1544,14 +1168,28 @@ async function prepareExpressChat(
   }
 
   const quota = getOrUpdateQuota(caller.uid, true, cfg.AI_RATE_LIMIT_PER_MIN, cfg.AI_RATE_LIMIT_PER_DAY);
-  const lastUserTurn = [...cleanHistory].reverse().find(h => h.role === 'user')?.text || '';
-  const kb = await retrieveSkillFlixKnowledge(
+
+  const rawName = isOwner
+    ? PLATFORM_OWNER_NAME
+    : (typeof userProfile?.displayName === 'string' && userProfile.displayName.trim()) ||
+      caller.name ||
+      'Student';
+  const viewerFirstName = rawName.split(/\s+/)[0] || 'Student';
+  const viewerRoleLabel = isOwner ? 'owner' : isMasterAdmin ? 'super_admin' : isAdmin ? 'admin' : 'student';
+
+  const toolCtx: ToolExecutionContext = {
+    projectId: FIREBASE_PROJECT_ID,
     caller,
-    `${cleanMessage} ${lastUserTurn.slice(0, 120)}`,
     userProfile,
-    saToken
-  );
-  const systemInstruction = buildSystemInstruction(kb);
+    saToken,
+    isOwner,
+    isMasterAdmin,
+    isAdmin,
+    memo: new Map(),
+    knownSecrets: [geminiKey, altProviderKey].filter(Boolean)
+  };
+
+  const systemInstruction = buildSmartSystemInstruction(viewerFirstName, viewerRoleLabel);
 
   return {
     cfg,
@@ -1559,7 +1197,7 @@ async function prepareExpressChat(
     geminiKey,
     altProviderKey,
     quota,
-    kb,
+    toolCtx,
     systemInstruction,
     cleanHistory,
     cleanMessage
@@ -1571,7 +1209,7 @@ export async function handleSkillFlixAiChat(
   body: AiChatRequestBody,
   externalSignal?: AbortSignal
 ): Promise<AiChatReply> {
-  const ctx = await prepareExpressChat(caller, body);
+  const ctx = await prepareExpressValidation(caller, body);
 
   let result: { text: string; model: string };
   let providerLabel: string;
@@ -1585,16 +1223,19 @@ export async function handleSkillFlixAiChat(
       ctx.cleanHistory,
       ctx.cleanMessage,
       ctx.quota,
+      ctx.toolCtx,
       externalSignal
     );
     providerLabel = 'Google Gemini API (Free Tier)';
   } else {
+    const toolResults = await routeAndExecuteToolsForPrompt(ctx.cleanMessage, ctx.cleanHistory, ctx.toolCtx);
+    const augmentedInstruction = `${ctx.systemInstruction}\n\nREALTIME_SKILLFLIX_DATA:\n${JSON.stringify(toolResults)}`;
     result = await generateWithOpenAiCompatibleProvider(
       ctx.cfg.AI_PROVIDER as 'openrouter' | 'groq',
       ctx.altProviderKey,
       ctx.cfg.GEMINI_AI_MODEL,
       ctx.cfg.GEMINI_FALLBACK_MODEL,
-      ctx.systemInstruction,
+      augmentedInstruction,
       ctx.cleanHistory,
       ctx.cleanMessage,
       ctx.quota,
@@ -1603,8 +1244,9 @@ export async function handleSkillFlixAiChat(
     providerLabel = ctx.cfg.AI_PROVIDER;
   }
 
+  const allCourseNames = await getAllActiveCourseNames(ctx.toolCtx);
   const lowerReply = result.text.toLowerCase();
-  const referencedCourses = ctx.kb.allCourseNames.filter(name =>
+  const referencedCourses = allCourseNames.filter(name =>
     lowerReply.includes(name.toLowerCase())
   );
 
@@ -1623,14 +1265,20 @@ export async function handleSkillFlixAiChatStream(
   body: AiChatRequestBody,
   hooks: {
     onHeadersReady?: () => void;
+    onKeepalive?: () => void;
     sendEvent: (event: string, data: unknown) => void;
   },
   externalSignal?: AbortSignal
 ): Promise<void> {
-  const ctx = await prepareExpressChat(caller, body);
+  const ctx = await prepareExpressValidation(caller, body);
   const providerLabel = ctx.useGemini ? 'Google Gemini API (Free Tier)' : ctx.cfg.AI_PROVIDER;
 
+  // Open SSE stream immediately + emit keepalive pings so mobile proxies never drop connection
   hooks.onHeadersReady?.();
+  hooks.onKeepalive?.();
+  const keepaliveTimer = setInterval(() => {
+    hooks.onKeepalive?.();
+  }, 3500);
 
   try {
     const onStartModel = (modelName: string) => {
@@ -1645,35 +1293,42 @@ export async function handleSkillFlixAiChatStream(
       hooks.sendEvent('chunk', { delta });
     };
 
-    const result = ctx.useGemini
-      ? await streamWithGeminiSdk(
-          ctx.geminiKey,
-          ctx.cfg.GEMINI_AI_MODEL,
-          ctx.cfg.GEMINI_FALLBACK_MODEL,
-          ctx.systemInstruction,
-          ctx.cleanHistory,
-          ctx.cleanMessage,
-          ctx.quota,
-          onStartModel,
-          onDelta,
-          externalSignal
-        )
-      : await streamWithOpenAiCompatibleProvider(
-          ctx.cfg.AI_PROVIDER as 'openrouter' | 'groq',
-          ctx.altProviderKey,
-          ctx.cfg.GEMINI_AI_MODEL,
-          ctx.cfg.GEMINI_FALLBACK_MODEL,
-          ctx.systemInstruction,
-          ctx.cleanHistory,
-          ctx.cleanMessage,
-          ctx.quota,
-          onStartModel,
-          onDelta,
-          externalSignal
-        );
+    let result: { text: string; model: string };
+    if (ctx.useGemini) {
+      result = await streamWithGeminiSdk(
+        ctx.geminiKey,
+        ctx.cfg.GEMINI_AI_MODEL,
+        ctx.cfg.GEMINI_FALLBACK_MODEL,
+        ctx.systemInstruction,
+        ctx.cleanHistory,
+        ctx.cleanMessage,
+        ctx.quota,
+        ctx.toolCtx,
+        onStartModel,
+        onDelta,
+        externalSignal
+      );
+    } else {
+      const toolResults = await routeAndExecuteToolsForPrompt(ctx.cleanMessage, ctx.cleanHistory, ctx.toolCtx);
+      const augmentedInstruction = `${ctx.systemInstruction}\n\nREALTIME_SKILLFLIX_DATA:\n${JSON.stringify(toolResults)}`;
+      result = await streamWithOpenAiCompatibleProvider(
+        ctx.cfg.AI_PROVIDER as 'openrouter' | 'groq',
+        ctx.altProviderKey,
+        ctx.cfg.GEMINI_AI_MODEL,
+        ctx.cfg.GEMINI_FALLBACK_MODEL,
+        augmentedInstruction,
+        ctx.cleanHistory,
+        ctx.cleanMessage,
+        ctx.quota,
+        onStartModel,
+        onDelta,
+        externalSignal
+      );
+    }
 
+    const allCourseNames = await getAllActiveCourseNames(ctx.toolCtx);
     const lowerReply = result.text.toLowerCase();
-    const referencedCourses = ctx.kb.allCourseNames.filter(name =>
+    const referencedCourses = allCourseNames.filter(name =>
       lowerReply.includes(name.toLowerCase())
     );
 
@@ -1701,6 +1356,8 @@ export async function handleSkillFlixAiChatStream(
       error: message,
       quota: err instanceof AiServiceError && err.quota ? err.quota : ctx.quota
     });
+  } finally {
+    clearInterval(keepaliveTimer);
   }
 }
 
@@ -1741,7 +1398,8 @@ export async function testAiConfigurationConnection(adminToken: string): Promise
         'You are Skill-Flix AI. Reply concisely with "Skill-Flix AI connection verified."',
         [],
         'Ping',
-        dummyQuota
+        dummyQuota,
+        undefined
       );
       return {
         success: true,

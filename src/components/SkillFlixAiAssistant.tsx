@@ -25,14 +25,14 @@ interface SkillFlixAiAssistantProps {
 }
 
 const WELCOME_TEXT =
-  "Hey! Welcome to Skill-Flix. I'm your personal AI learning assistant. Ask me anything about video editing, courses, PDFs or creative skills. Let's learn something new!";
+  "Hey! Welcome to Skill-Flix. I'm your personal AI learning assistant. Ask me about courses, videos, PDFs, pricing, your account status, support, or video editing tips!";
 
 const SUGGESTED_QUESTIONS: string[] = [
-  'Help me learn video editing.',
-  'Which course is best for beginners?',
-  'Explain Alight Motion.',
-  'Find my course resources.',
-  'Give me editing tips.'
+  'Website par kitne videos & PDFs hain?',
+  'All-Access aur course prices kya hain?',
+  'Mera subscription & courses status?',
+  'Skill-Flix ka Owner & support contact?',
+  'Help me learn video editing.'
 ];
 
 function createWelcomeMessage(): AiChatMessage {
@@ -272,7 +272,7 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
     setLastFailedPrompt(null);
   };
 
-  const submitPrompt = async (rawPrompt: string) => {
+  const submitPrompt = async (rawPrompt: string, options: { isRetry?: boolean } = {}) => {
     const cleanPrompt = rawPrompt.trim();
     if (!cleanPrompt || isSending || inFlightRef.current) return;
 
@@ -287,6 +287,19 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
     setErrorBanner(null);
     setLastFailedPrompt(null);
 
+    const lastExisting = messages[messages.length - 1];
+    const shouldReuseLastUserMsg =
+      Boolean(options.isRetry) &&
+      Boolean(lastExisting) &&
+      lastExisting.role === 'user' &&
+      lastExisting.text.trim() === cleanPrompt;
+
+    const historySource = shouldReuseLastUserMsg ? messages.slice(0, -1) : messages;
+    const historyForServer = historySource
+      .filter(m => m.id !== 'skillflix_welcome' && !m.isError && m.text.trim().length > 0)
+      .slice(-6)
+      .map(m => ({ role: m.role, text: m.text }));
+
     const userMsg: AiChatMessage = {
       id: `u_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       role: 'user',
@@ -296,11 +309,6 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
 
     const assistantId = `a_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 
-    const historyForServer = messages
-      .filter(m => m.id !== 'skillflix_welcome' && !m.isError && m.text.trim().length > 0)
-      .slice(-6)
-      .map(m => ({ role: m.role, text: m.text }));
-
     const seq = ++requestSeqRef.current;
     const controller = new AbortController();
     activeControllerRef.current = controller;
@@ -309,8 +317,10 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
     let streamModel = statusInfo?.model;
     let receivedAnyChunk = false;
 
-    setMessages(prev => [...prev, userMsg]);
-    setInput('');
+    if (!shouldReuseLastUserMsg) {
+      setMessages(prev => [...prev, userMsg]);
+      setInput('');
+    }
     setIsSending(true);
 
     try {
@@ -648,7 +658,7 @@ export const SkillFlixAiAssistant: React.FC<SkillFlixAiAssistantProps> = ({
                   {lastFailedPrompt && currentUser?.uid && errorBanner?.code !== 'USER_DAILY_LIMIT' && (
                     <button
                       type="button"
-                      onClick={() => void submitPrompt(lastFailedPrompt)}
+                      onClick={() => void submitPrompt(lastFailedPrompt, { isRetry: true })}
                       className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-300 text-[11px] font-semibold cursor-pointer"
                     >
                       <RefreshCw className="w-3 h-3" />
