@@ -193,8 +193,8 @@ service cloud.firestore {
         || (self(uid) && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
           'uid','displayName','photoURL','phoneNumber','authProvider','lastLogin','lastLoginAt'
         ])
-          && request.resource.data.email == resource.data.email
-          && request.resource.data.role == resource.data.role
+          && request.resource.data.get('email', '') == resource.data.get('email', '')
+          && request.resource.data.get('role', 'user') == resource.data.get('role', 'user')
           && (!('uid' in request.resource.data) || request.resource.data.uid == uid))
         || (owner() && self(uid) && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
           'uid','displayName','photoURL','phoneNumber','authProvider','lastLogin','lastLoginAt',

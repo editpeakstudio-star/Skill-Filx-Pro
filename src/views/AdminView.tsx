@@ -34,6 +34,7 @@ import {
   ChevronDown,
   History,
   AlertTriangle,
+  AlertCircle,
   UserCheck,
   UserX,
   Move,
@@ -131,6 +132,9 @@ interface AdminViewProps {
   videos: VideoLesson[];
   pdfs: PdfResource[];
   users: UserProfile[];
+  usersLoading?: boolean;
+  usersError?: string | null;
+  onRetryUsersSync?: () => void;
   paymentRequests: PaymentRequest[];
   settings: PlatformSettings;
   sales: SalesRecord[];
@@ -146,6 +150,9 @@ export const AdminView: React.FC<AdminViewProps> = ({
   videos,
   pdfs,
   users,
+  usersLoading = false,
+  usersError = null,
+  onRetryUsersSync,
   paymentRequests,
   settings,
   sales,
@@ -1049,6 +1056,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
   const totalRevenue = reconciledAnalyticsSummary.lifetime.revenue;
   const pendingPaymentsCount = paymentRequests.filter(p => p.status === 'pending').length;
 
+  const ownerCount = users.filter(u => isProtectedOwner(u)).length;
   const studentCount = users.filter(u => u.role === 'user' && !isProtectedOwner(u)).length;
   const adminCount = users.filter(u => u.role === 'admin' && !isProtectedOwner(u)).length;
   const masterCount = users.filter(u => u.role === 'master_admin' && !isProtectedOwner(u)).length;
@@ -1060,6 +1068,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
   }).length;
   const usersWithActiveAccessCount = users.filter(u => isUserAccessActive(u)).length;
   const suspendedUsersCount = users.filter(u => u.isSuspended || u.accountStatus === 'suspended').length;
+  const hasActiveUserFilters = Boolean(userSearch.trim()) || userRoleFilter !== 'all' || userAccessFilter !== 'all';
 
   // Role badge renderer matching brand specifications:
   // Gold for Owner, Purple for Super Admin, Blue for Admin, Neutral for Student
@@ -2424,7 +2433,7 @@ export const AdminView: React.FC<AdminViewProps> = ({
                   { id: 'student', label: `Students (${studentCount})` },
                   { id: 'admin', label: `Admins (${adminCount})` },
                   { id: 'master', label: `Super Admins (${masterCount})` },
-                  { id: 'owner', label: 'Owner (1)' }
+                  { id: 'owner', label: `Owner (${ownerCount})` }
                 ].map((f) => (
                   <button
                     key={f.id}
@@ -2466,25 +2475,78 @@ export const AdminView: React.FC<AdminViewProps> = ({
               </div>
             </div>
 
+            {/* Firestore Live Sync Error Banner */}
+            {usersError && (
+              <div className="p-3.5 rounded-2xl bg-rose-950/40 border border-rose-500/40 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs">
+                <div className="flex items-start gap-2.5 min-w-0">
+                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                  <div className="min-w-0">
+                    <p className="font-bold text-rose-200">Live Users Sync Issue</p>
+                    <p className="text-[11px] text-rose-300/90 break-words">{usersError}</p>
+                  </div>
+                </div>
+                {onRetryUsersSync && (
+                  <button
+                    type="button"
+                    onClick={onRetryUsersSync}
+                    className="px-3 py-1.5 rounded-xl bg-rose-500/20 hover:bg-rose-500/30 border border-rose-400/40 text-rose-100 text-xs font-bold flex items-center gap-1.5 shrink-0 cursor-pointer"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Retry Live Sync</span>
+                  </button>
+                )}
+              </div>
+            )}
+
             {/* Quick Metrics Chip Summary */}
             <div className="p-3 rounded-xl bg-[#090D16] border border-blue-500/10 flex flex-wrap items-center justify-between gap-2 text-[11px] text-zinc-400">
-              <div className="flex items-center gap-2">
-                <span className="font-semibold text-white">Showing {filteredUsers.length} of {users.length} Users</span>
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="font-semibold text-white">
+                  {usersLoading ? 'Syncing users...' : `Showing ${filteredUsers.length} of ${users.length} Users`}
+                </span>
                 <span className="text-zinc-600">•</span>
                 <span className="text-emerald-400 font-semibold">{allAccessCount} All-Access</span>
               </div>
               <span className="text-zinc-500 font-mono text-[10px]">
-                {adminCount + masterCount + 1} System Authorities
+                {adminCount + masterCount + ownerCount} System Authorities
               </span>
             </div>
 
             {/* User Management Cards (Mobile-First Single Column) */}
             <div className="space-y-3.5">
-              {filteredUsers.length === 0 ? (
-                <div className="p-8 rounded-2xl bg-[#090D16] border border-zinc-800 text-center space-y-2">
+              {usersLoading && users.length === 0 ? (
+                <div className="p-8 rounded-2xl bg-[#090D16] border border-blue-500/20 text-center space-y-2.5">
+                  <div className="w-7 h-7 border-2 border-cyan-400 border-t-transparent rounded-full animate-spin mx-auto" />
+                  <p className="text-xs font-bold text-zinc-200">Loading real-time user directory...</p>
+                  <p className="text-[11px] text-zinc-500">Connecting to Cloud Firestore users collection.</p>
+                </div>
+              ) : filteredUsers.length === 0 ? (
+                <div className="p-8 rounded-2xl bg-[#090D16] border border-zinc-800 text-center space-y-3">
                   <Users className="w-8 h-8 text-zinc-600 mx-auto" />
-                  <p className="text-xs font-bold text-zinc-300">No users match your search criteria</p>
-                  <p className="text-[11px] text-zinc-500">Try clearing the search query, resetting status filters, or click Sync Auth Users.</p>
+                  <p className="text-xs font-bold text-zinc-300">
+                    {hasActiveUserFilters
+                      ? 'No users match your search criteria'
+                      : 'No registered users found in Firestore yet'}
+                  </p>
+                  <p className="text-[11px] text-zinc-500">
+                    {hasActiveUserFilters
+                      ? 'Try clearing the search query or resetting active role and status filters.'
+                      : 'Newly registered users appear here automatically. You can also click Sync Auth Users to backfill pre-existing accounts.'}
+                  </p>
+                  {hasActiveUserFilters && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setUserSearch('');
+                        setUserRoleFilter('all');
+                        setUserAccessFilter('all');
+                      }}
+                      className="px-3.5 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold cursor-pointer inline-flex items-center gap-1.5"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                      <span>Reset All Filters</span>
+                    </button>
+                  )}
                 </div>
               ) : (
                 filteredUsers.map((user) => {

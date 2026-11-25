@@ -57,6 +57,9 @@ function AppContent() {
   const [videoCatalog, setVideoCatalog] = useState<VideoCatalogEntry[]>([]);
   const [pdfs, setPdfs] = useState<PdfResource[]>([]);
   const [users, setUsers] = useState<UserProfile[]>([]);
+  const [usersLoading, setUsersLoading] = useState(false);
+  const [usersError, setUsersError] = useState<string | null>(null);
+  const [usersRetryKey, setUsersRetryKey] = useState(0);
   const [paymentRequests, setPaymentRequests] = useState<PaymentRequest[]>([]);
   const [settings, setSettings] = useState<PlatformSettings>(DEFAULT_SETTINGS);
   const [sales, setSales] = useState<SalesRecord[]>([]);
@@ -107,7 +110,6 @@ function AppContent() {
       setFolders([]);
       setVideos([]);
       setPdfs([]);
-      setUsers([]);
       setPaymentRequests([]);
       setSales([]);
       setAuditLogs([]);
@@ -123,7 +125,6 @@ function AppContent() {
     const unsubSettings = subscribeToSettings((s) => setSettings(s));
     const unsubSales = subscribeToSales((sl) => setSales(sl));
     const unsubAudit = subscribeToAuditLogs((logs) => setAuditLogs(logs));
-    const unsubUsers = subscribeToUsers(setUsers);
     const unsubPayments = subscribeToPaymentRequests(setPaymentRequests);
     const canViewDrafts =
       currentUser.role === 'admin' || currentUser.role === 'master_admin';
@@ -137,7 +138,6 @@ function AppContent() {
       unsubSettings();
       unsubSales();
       unsubAudit();
-      unsubUsers();
       unsubPayments();
       unsubVideos();
       unsubPdfs();
@@ -152,6 +152,41 @@ function AppContent() {
     currentUser?.subscriptionStatus,
     currentUser?.isSuspended,
     currentUser?.accountStatus
+  ]);
+
+  // Real-time users directory subscription for admins/owner (decoupled from student entitlement fields)
+  useEffect(() => {
+    const isAdminActor =
+      Boolean(currentUser?.uid) &&
+      (currentUser?.isPlatformOwner === true ||
+        currentUser?.role === 'admin' ||
+        currentUser?.role === 'master_admin') &&
+      currentUser?.isSuspended !== true;
+
+    if (!isAdminActor) {
+      setUsers([]);
+      setUsersLoading(false);
+      setUsersError(null);
+      return;
+    }
+
+    const unsubUsers = subscribeToUsers(setUsers, {
+      actorUser: currentUser,
+      onStatus: ({ loading, error }) => {
+        setUsersLoading(loading);
+        setUsersError(error);
+      }
+    });
+
+    return () => {
+      unsubUsers();
+    };
+  }, [
+    currentUser?.uid,
+    currentUser?.role,
+    currentUser?.isSuspended,
+    currentUser?.isPlatformOwner,
+    usersRetryKey
   ]);
 
   // Signed-out visitors (and students without an entitlement) still see the
@@ -335,6 +370,9 @@ function AppContent() {
             videos={visibleVideos}
             pdfs={visiblePdfs}
             users={users}
+            usersLoading={usersLoading}
+            usersError={usersError}
+            onRetryUsersSync={() => setUsersRetryKey((k) => k + 1)}
             paymentRequests={paymentRequests}
             settings={settings}
             sales={sales}

@@ -11,6 +11,8 @@ import {
   browserLocalPersistence,
   GoogleAuthProvider,
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   RecaptchaVerifier,
   signInWithPhoneNumber,
   ConfirmationResult,
@@ -52,9 +54,19 @@ import {
 } from '../types';
 import type { VideoCatalogEntry } from '../types';
 import { notifyPaymentResolution, notifyPaymentSubmitted } from './telegramApi';
+import {
+  PLATFORM_OWNER_EMAIL,
+  resolveAuthProvider,
+  normalizeUserProfile,
+  buildNewUserDocument,
+  buildExistingUserUpdatePayload,
+  dedupeAndSortUsers,
+  isTransientOrConflictSyncError
+} from './userSyncHelpers';
+
+export { resolveAuthProvider, normalizeUserProfile };
 
 export const DEFAULT_UPI_ID = 'rg570251-1@oksbi';
-const PLATFORM_OWNER_EMAIL = 'editpeakstudio@gmail.com';
 
 // Firebase web app configuration for skillflix-academy.
 const firebaseConfig = {
@@ -487,29 +499,6 @@ export function hasPermission(user: UserProfile | null, permission: PermissionKe
 // AUTHENTICATION & ENTITLEMENT HELPERS
 // ==========================================
 
-export function resolveAuthProvider(fbUser?: FirebaseUser | null, existingProvider?: string): string {
-  const providerId = fbUser?.providerData?.[0]?.providerId;
-  if (providerId === 'google.com') return 'google';
-  if (providerId === 'password') return 'password';
-  if (providerId === 'phone') return 'phone';
-  if (providerId) return providerId;
-  return existingProvider || 'email/password';
-}
-
-function toIsoDateValue(value: unknown): string | undefined {
-  if (!value) return undefined;
-  if (typeof value === 'string') return value;
-  if (value instanceof Date) return value.toISOString();
-  if (typeof (value as any)?.toDate === 'function') {
-    try {
-      return (value as any).toDate().toISOString();
-    } catch {
-      return undefined;
-    }
-  }
-  return undefined;
-}
-
 export function isUserAccessExpired(user?: UserProfile | null): boolean {
   if (!user) return false;
   if (isProtectedOwner(user)) return false;
@@ -544,189 +533,118 @@ export function hasCourseAccess(user: UserProfile | null | undefined, categoryId
   );
 }
 
-function normalizeUserProfile(
-  uid: string,
-  rawData: Record<string, any>,
-  fbUser?: FirebaseUser | null
-): UserProfile {
-  const email = String(rawData.email || fbUser?.email || '').trim();
-  const isOwner =
-    rawData.isPlatformOwner === true ||
-    (!!fbUser &&
-      fbUser.emailVerified === true &&
-      fbUser.email?.trim().toLowerCase() === PLATFORM_OWNER_EMAIL);
-  const role: UserRole = isOwner
-    ? 'master_admin'
-    : rawData.role === 'admin' || rawData.role === 'master_admin'
-      ? rawData.role
-      : 'user';
-  const suspended = isOwner ? false : (rawData.isSuspended === true || rawData.accountStatus === 'suspended');
-  const mergedCourses = Array.from(
-    new Set([
-      ...(Array.isArray(rawData.allowedCategories) ? rawData.allowedCategories : []),
-      ...(Array.isArray(rawData.assignedCourses) ? rawData.assignedCourses : [])
-    ].filter((v): v is string => typeof v === 'string' && v.trim().length > 0))
-  );
-  const createdAt = toIsoDateValue(rawData.createdAt) || fbUser?.metadata?.creationTime || new Date().toISOString();
-  const lastLoginAt =
-    toIsoDateValue(rawData.lastLoginAt) ||
-    toIsoDateValue(rawData.lastLogin) ||
-    fbUser?.metadata?.lastSignInTime ||
-    createdAt;
-  const accessExpiry = rawData.accessExpiry === null
-    ? null
-    : toIsoDateValue(rawData.accessExpiry) ?? toIsoDateValue(rawData.accessExpiryAt) ?? null;
+const pendingRegistrationNames = new Map<string, string>();
+const profileSyncQueues = new Map<string, Promise<unknown>>();
 
-  return {
-    uid,
-    email,
-    displayName:
-      String(
-        rawData.displayName ||
-          fbUser?.displayName ||
-          fbUser?.phoneNumber ||
-          email.split('@')[0] ||
-          'Student'
-      ).trim() || 'Student',
-    photoURL: fbUser?.photoURL || rawData.photoURL || undefined,
-    phoneNumber: fbUser?.phoneNumber || rawData.phoneNumber || undefined,
-    authProvider: resolveAuthProvider(fbUser, rawData.authProvider),
-    role,
-    isPlatformOwner: isOwner,
-    predefinedRole: isOwner ? 'owner' : rawData.predefinedRole,
-    assignedRoleTitle: isOwner ? 'Platform Owner' : rawData.assignedRoleTitle,
-    permissions: isOwner
-      ? SYSTEM_PERMISSIONS.map(p => p.key)
-      : Array.isArray(rawData.permissions)
-        ? rawData.permissions
-        : [],
-    isSuspended: suspended,
-    accountStatus: suspended ? 'suspended' : 'active',
-    hasAllAccess: isOwner || rawData.hasAllAccess === true,
-    allowedCategories: mergedCourses,
-    assignedCourses: mergedCourses,
-    allowedFolders: Array.isArray(rawData.allowedFolders) ? rawData.allowedFolders : [],
-    subscriptionStatus: isOwner
-      ? 'active'
-      : rawData.subscriptionStatus || (mergedCourses.length > 0 || rawData.hasAllAccess === true ? 'active' : 'none'),
-    accessExpiry,
-    lastLogin: lastLoginAt,
-    lastLoginAt,
-    createdAt
-  };
+async function readUserProfileSnapshot(profileRef: ReturnType<typeof doc>) {
+  try {
+    return await getDocFromServer(profileRef);
+  } catch (err) {
+    const { isOfflineOrUnavailable } = isTransientOrConflictSyncError(err);
+    if (isOfflineOrUnavailable) {
+      return await getDoc(profileRef);
+    }
+    return await getDoc(profileRef);
+  }
 }
 
-const pendingRegistrationNames = new Map<string, string>();
-const inFlightProfileLoads = new Map<string, Promise<UserProfile>>();
+async function runSerializedForUid<T>(uid: string, task: () => Promise<T>): Promise<T> {
+  const previous = profileSyncQueues.get(uid) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(task);
+  profileSyncQueues.set(uid, next);
+  try {
+    return await next;
+  } finally {
+    if (profileSyncQueues.get(uid) === next) {
+      profileSyncQueues.delete(uid);
+    }
+  }
+}
 
 async function loadAuthenticatedProfile(
   fbUser: FirebaseUser,
   options: { updateLastLogin?: boolean; explicitDisplayName?: string } = {}
 ): Promise<UserProfile> {
   if (!db) throw new Error('Firebase Firestore is unavailable. Check the Firebase project configuration.');
-  const loadKey = `${fbUser.uid}:${options.updateLastLogin ? 'login' : 'sync'}`;
-  const existingLoad = inFlightProfileLoads.get(loadKey);
-  if (existingLoad && !options.explicitDisplayName) {
-    return existingLoad;
-  }
 
-  const run = (async () => {
+  return runSerializedForUid(fbUser.uid, async () => {
     const cleanEmail = (fbUser.email || '').trim().toLowerCase();
-    const isOwner = fbUser.emailVerified === true && cleanEmail === PLATFORM_OWNER_EMAIL;
     const profileRef = doc(db, 'users', fbUser.uid);
-    const remote = await getDoc(profileRef);
-    const data = remote.exists() ? remote.data() : {};
-    const nowIso = new Date().toISOString();
     const pendingName = cleanEmail ? pendingRegistrationNames.get(cleanEmail) : undefined;
-    const resolvedName = (
-      options.explicitDisplayName ||
-      pendingName ||
-      data.displayName ||
-      fbUser.displayName ||
-      fbUser.phoneNumber ||
-      fbUser.email?.split('@')[0] ||
-      'Student'
-    ).trim();
+    const nowIso = new Date().toISOString();
 
-    const authProvider = resolveAuthProvider(fbUser, data.authProvider);
-    const role: UserRole = isOwner
-      ? 'master_admin'
-      : (data.role === 'admin' || data.role === 'master_admin' ? data.role : 'user');
-    const mergedCourses = Array.from(
-      new Set([
-        ...(Array.isArray(data.allowedCategories) ? data.allowedCategories : []),
-        ...(Array.isArray(data.assignedCourses) ? data.assignedCourses : [])
-      ].filter((v): v is string => typeof v === 'string' && v.trim().length > 0))
-    );
-    const suspended = isOwner ? false : (data.isSuspended === true || data.accountStatus === 'suspended');
-    const lastLoginIso = (options.updateLastLogin || !remote.exists())
-      ? nowIso
-      : (data.lastLoginAt || data.lastLogin || nowIso);
-
-    const profile: UserProfile = {
-      uid: fbUser.uid,
-      email: data.email || fbUser.email || '',
-      displayName: resolvedName,
-      photoURL: fbUser.photoURL || data.photoURL || undefined,
-      phoneNumber: fbUser.phoneNumber || data.phoneNumber || undefined,
-      authProvider,
-      role,
-      isPlatformOwner: isOwner,
-      predefinedRole: isOwner ? 'owner' : data.predefinedRole,
-      assignedRoleTitle: isOwner ? 'Platform Owner' : data.assignedRoleTitle,
-      permissions: isOwner ? SYSTEM_PERMISSIONS.map(p => p.key) : Array.isArray(data.permissions) ? data.permissions : [],
-      isSuspended: suspended,
-      accountStatus: suspended ? 'suspended' : 'active',
-      hasAllAccess: isOwner || data.hasAllAccess === true,
-      allowedCategories: mergedCourses,
-      assignedCourses: mergedCourses,
-      allowedFolders: Array.isArray(data.allowedFolders) ? data.allowedFolders : [],
-      subscriptionStatus: isOwner ? 'active' : data.subscriptionStatus || 'none',
-      accessExpiry: data.accessExpiry ?? null,
-      lastLogin: lastLoginIso,
-      lastLoginAt: lastLoginIso,
-      createdAt: data.createdAt || fbUser.metadata?.creationTime || nowIso
-    };
+    let remote = await readUserProfileSnapshot(profileRef);
+    let profile: UserProfile;
 
     if (!remote.exists()) {
-      const cleanDoc = Object.fromEntries(
-        Object.entries({
-          ...profile,
-          accessExpiryAt: null
-        }).filter(([, value]) => value !== undefined)
-      );
-      await setDoc(profileRef, cleanDoc);
+      const { profile: newProfile, firestoreDoc } = buildNewUserDocument(fbUser, {
+        explicitDisplayName: options.explicitDisplayName,
+        pendingName,
+        nowIso
+      });
+
+      try {
+        await setDoc(profileRef, firestoreDoc);
+        profile = newProfile;
+      } catch (writeErr: any) {
+        const flags = isTransientOrConflictSyncError(writeErr);
+        // Handle race condition where Cloud Function or parallel sign-in created the doc first,
+        // or where the fresh Auth token hadn't propagated to Firestore yet.
+        if (flags.isAlreadyExists || flags.isPermissionDenied) {
+          try {
+            await fbUser.getIdToken(true);
+          } catch {
+            // Best-effort token refresh before re-checking
+          }
+          remote = await readUserProfileSnapshot(profileRef);
+          if (remote.exists()) {
+            const existingData = remote.data() || {};
+            const { updatePayload, mergedProfile } = buildExistingUserUpdatePayload({
+              fbUser,
+              existingData,
+              explicitDisplayName: options.explicitDisplayName,
+              pendingName,
+              updateLastLogin: options.updateLastLogin,
+              nowIso
+            });
+            if (Object.keys(updatePayload).length > 0) {
+              await updateDoc(profileRef, updatePayload);
+            }
+            profile = mergedProfile;
+          } else {
+            // Retry creation once after token refresh
+            await setDoc(profileRef, firestoreDoc);
+            profile = newProfile;
+          }
+        } else {
+          throw writeErr;
+        }
+      }
     } else {
-      const updatePayload: Record<string, any> = {};
-      if (data.uid !== fbUser.uid) updatePayload.uid = fbUser.uid;
-      if (resolvedName && data.displayName !== resolvedName && (!data.displayName || data.displayName === 'Student' || options.explicitDisplayName)) {
-        updatePayload.displayName = resolvedName;
-      }
-      if ((fbUser.photoURL || null) !== (data.photoURL ?? null) && fbUser.photoURL) {
-        updatePayload.photoURL = fbUser.photoURL;
-      }
-      if ((fbUser.phoneNumber || null) !== (data.phoneNumber ?? null) && fbUser.phoneNumber) {
-        updatePayload.phoneNumber = fbUser.phoneNumber;
-      }
-      if (data.authProvider !== authProvider) {
-        updatePayload.authProvider = authProvider;
-      }
-      if (options.updateLastLogin || !data.lastLoginAt || !data.lastLogin) {
-        updatePayload.lastLogin = nowIso;
-        updatePayload.lastLoginAt = nowIso;
-      }
-      if (isOwner) {
-        if (data.isPlatformOwner !== true) updatePayload.isPlatformOwner = true;
-        if (data.role !== 'master_admin') updatePayload.role = 'master_admin';
-        if (data.hasAllAccess !== true) updatePayload.hasAllAccess = true;
-        if (data.subscriptionStatus !== 'active') updatePayload.subscriptionStatus = 'active';
-        if (data.accountStatus !== 'active') updatePayload.accountStatus = 'active';
-        if (data.isSuspended !== false) updatePayload.isSuspended = false;
-      }
+      const existingData = remote.data() || {};
+      const { updatePayload, mergedProfile } = buildExistingUserUpdatePayload({
+        fbUser,
+        existingData,
+        explicitDisplayName: options.explicitDisplayName,
+        pendingName,
+        updateLastLogin: options.updateLastLogin,
+        nowIso
+      });
 
       if (Object.keys(updatePayload).length > 0) {
-        await updateDoc(profileRef, updatePayload);
+        try {
+          await updateDoc(profileRef, updatePayload);
+        } catch (updateErr: any) {
+          const flags = isTransientOrConflictSyncError(updateErr);
+          if (flags.isPermissionDenied) {
+            await fbUser.getIdToken(true);
+            await updateDoc(profileRef, updatePayload);
+          } else {
+            throw updateErr;
+          }
+        }
       }
+      profile = mergedProfile;
     }
 
     const cached = readStorage<Record<string, UserProfile>>(STORAGE_KEYS.USERS, {});
@@ -734,14 +652,14 @@ async function loadAuthenticatedProfile(
     writeStorage(STORAGE_KEYS.USERS, cached);
     writeStorage(STORAGE_KEYS.CURRENT_USER, profile);
     return profile;
-  })();
+  });
+}
 
-  inFlightProfileLoads.set(loadKey, run);
-  try {
-    return await run;
-  } finally {
-    inFlightProfileLoads.delete(loadKey);
-  }
+export async function syncCurrentUserProfile(): Promise<UserProfile | null> {
+  if (!auth?.currentUser || !db) return null;
+  const profile = await loadAuthenticatedProfile(auth.currentUser, { updateLastLogin: false });
+  eventBus.emit('auth', profile);
+  return profile;
 }
 
 export async function getCurrentUserProfile(): Promise<UserProfile | null> {
@@ -758,8 +676,29 @@ export function subscribeToAuth(callback: (user: UserProfile | null) => void): (
   let unsubFb: (() => void) | null = null;
   let unsubUserDoc: (() => void) | null = null;
   let recordedLoginForUid: string | null = null;
+  let disposed = false;
 
   if (auth) {
+    // Handle redirect-based Google Sign-In results (used as mobile/iframe popup fallback)
+    void getRedirectResult(auth)
+      .then(async (redirectResult) => {
+        if (disposed || !redirectResult?.user) return;
+        try {
+          await redirectResult.user.getIdToken(true);
+          const profile = await loadAuthenticatedProfile(redirectResult.user, { updateLastLogin: true });
+          if (!disposed) {
+            eventBus.emit('auth', profile);
+          }
+        } catch (syncErr) {
+          console.error('Could not synchronize Google redirect sign-in user:', syncErr);
+        }
+      })
+      .catch((redirectErr) => {
+        if (redirectErr?.code && redirectErr.code !== 'auth/no-auth-event') {
+          console.warn('Google redirect sign-in note:', redirectErr.message || redirectErr.code);
+        }
+      });
+
     try {
       unsubFb = fbOnAuthStateChanged(auth, async (fbUser: FirebaseUser | null) => {
         if (unsubUserDoc) {
@@ -777,12 +716,25 @@ export function subscribeToAuth(callback: (user: UserProfile | null) => void): (
               console.warn('Could not refresh the Firebase Auth session:', refreshError);
             }
 
+            if (disposed) return;
+
             const shouldUpdateLogin = recordedLoginForUid !== fbUser.uid;
             recordedLoginForUid = fbUser.uid;
 
-            const profile = await loadAuthenticatedProfile(fbUser, {
-              updateLastLogin: shouldUpdateLogin
-            });
+            let profile: UserProfile;
+            try {
+              profile = await loadAuthenticatedProfile(fbUser, {
+                updateLastLogin: shouldUpdateLogin
+              });
+            } catch (firstSyncErr) {
+              console.warn('Retrying Firestore user profile sync after token refresh:', firstSyncErr);
+              await fbUser.getIdToken(true).catch(() => undefined);
+              profile = await loadAuthenticatedProfile(fbUser, {
+                updateLastLogin: shouldUpdateLogin
+              });
+            }
+
+            if (disposed) return;
 
             if (profile && (profile.role === 'admin' || profile.role === 'master_admin')) {
               void purgeUnwantedRecordsFromFirestore();
@@ -795,10 +747,15 @@ export function subscribeToAuth(callback: (user: UserProfile | null) => void): (
               unsubUserDoc = onSnapshot(
                 doc(db, 'users', fbUser.uid),
                 (snap) => {
+                  if (disposed) return;
                   if (!snap.exists()) {
                     void loadAuthenticatedProfile(fbUser, { updateLastLogin: false })
-                      .then((created) => callback(created))
-                      .catch(() => {});
+                      .then((created) => {
+                        if (!disposed) callback(created);
+                      })
+                      .catch((recoverErr) => {
+                        console.error('Failed to restore missing Firestore user document:', recoverErr);
+                      });
                     return;
                   }
                   const liveProfile = normalizeUserProfile(fbUser.uid, snap.data(), fbUser);
@@ -814,13 +771,13 @@ export function subscribeToAuth(callback: (user: UserProfile | null) => void): (
               );
             }
           } catch (err) {
-            console.error('Could not load the signed-in profile:', err);
-            callback(null);
+            console.error('Could not synchronize signed-in user to Firestore:', err);
+            if (!disposed) callback(null);
           }
         } else {
           recordedLoginForUid = null;
           writeStorage(STORAGE_KEYS.CURRENT_USER, null);
-          callback(null);
+          if (!disposed) callback(null);
         }
       });
     } catch (e) {
@@ -829,6 +786,7 @@ export function subscribeToAuth(callback: (user: UserProfile | null) => void): (
   }
 
   return () => {
+    disposed = true;
     unsubStorage();
     if (unsubUserDoc) unsubUserDoc();
     if (unsubFb) unsubFb();
@@ -838,10 +796,16 @@ export function subscribeToAuth(callback: (user: UserProfile | null) => void): (
 // 1. LOGIN WITH GOOGLE (Continue with Google)
 export async function loginWithGoogle(): Promise<UserProfile> {
   if (!auth) throw new Error('Firebase Authentication is unavailable. Check the Firebase configuration and network connection.');
+  const provider = new GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: 'select_account' });
+
   try {
-    const provider = new GoogleAuthProvider();
-    provider.setCustomParameters({ prompt: 'select_account' });
     const result = await signInWithPopup(auth, provider);
+    try {
+      await result.user.getIdToken(true);
+    } catch {
+      // Non-fatal if fresh token already issued by signInWithPopup
+    }
     const profile = await loadAuthenticatedProfile(result.user, { updateLastLogin: true });
     if (result.user.email?.trim().toLowerCase() === PLATFORM_OWNER_EMAIL && !result.user.emailVerified) {
       try {
@@ -856,9 +820,16 @@ export async function loginWithGoogle(): Promise<UserProfile> {
     eventBus.emit('auth', profile);
     return profile;
   } catch (err: any) {
+    if (
+      err?.code === 'auth/popup-blocked' ||
+      err?.code === 'auth/operation-not-supported-in-this-environment'
+    ) {
+      await signInWithRedirect(auth, provider);
+      throw new Error('Redirecting to Google sign-in...');
+    }
     if (err.code === 'auth/popup-closed-by-user') throw new Error('Google sign-in was closed before completion.');
     if (err.code === 'auth/cancelled-popup-request') throw new Error('A Google sign-in request is already open.');
-    if (err.code === 'auth/unauthorized-domain') throw new Error('This site domain is not authorized in Firebase. Add 127.0.0.1 under Authentication → Settings → Authorized domains.');
+    if (err.code === 'auth/unauthorized-domain') throw new Error('This site domain is not authorized in Firebase. Add your preview/production domain under Authentication → Settings → Authorized domains.');
     throw firebaseAuthMessage(err, 'Google sign-in failed.');
   }
 }
@@ -1020,6 +991,12 @@ export async function registerUser(email: string, pass: string, name: string): P
   try {
     const credential = await fbCreateUserWithEmail(auth, cleanEmail, pass);
     await updateProfile(credential.user, { displayName: cleanName });
+    try {
+      await credential.user.reload();
+      await credential.user.getIdToken(true);
+    } catch {
+      // Non-fatal if token already refreshed
+    }
     const profile = await loadAuthenticatedProfile(credential.user, {
       updateLastLogin: true,
       explicitDisplayName: cleanName
@@ -2388,51 +2365,117 @@ function recalculateCategoryCounts() {
 // USER & AUTHORITY / ROLES MANAGEMENT SERVICE
 // ==========================================
 
-export function subscribeToUsers(callback: (users: UserProfile[]) => void): () => void {
-  // Never hydrate another user's private profile cache into an unauthenticated/demo session.
-  callback([]);
-  if (!db || !isFirebaseOnline || !auth?.currentUser) return () => {};
+export interface SubscribeToUsersOptions {
+  actorUser?: UserProfile | null;
+  onStatus?: (status: { loading: boolean; error: string | null }) => void;
+}
 
-  const unsubEvent = eventBus.subscribe<UserProfile[]>('users', callback);
-  let unsub: (() => void) | undefined;
+export function subscribeToUsers(
+  callback: (users: UserProfile[]) => void,
+  options: SubscribeToUsersOptions = {}
+): () => void {
+  const { actorUser, onStatus } = options;
+  if (!db || !isFirebaseOnline || !auth?.currentUser) {
+    callback([]);
+    onStatus?.({ loading: false, error: null });
+    return () => {};
+  }
+
+  const currentUid = auth.currentUser.uid;
+  const unsubEvent = eventBus.subscribe<UserProfile[]>('users', (list) => {
+    callback(dedupeAndSortUsers(list));
+  });
+
+  let unsubCollection: (() => void) | undefined;
+  let unsubActorDoc: (() => void) | undefined;
   let cancelled = false;
 
-  void getDoc(doc(db, 'users', auth.currentUser.uid)).then((actor) => {
-    if (cancelled) return;
-    const data = actor.exists() ? actor.data() : {};
-    const authorized = isCurrentAuthUserPlatformOwner() ||
-      ((data.role === 'admin' || data.role === 'master_admin') && data.isSuspended !== true);
-    if (!authorized) return;
+  onStatus?.({ loading: true, error: null });
 
-    unsub = onSnapshot(collection(db, 'users'), (snapshot) => {
-      const remote: UserProfile[] = [];
-      snapshot.forEach(docSnap => {
-        remote.push(normalizeUserProfile(docSnap.id, docSnap.data()));
-      });
+  const attachUsersCollectionListener = () => {
+    if (cancelled || unsubCollection) return;
+    unsubCollection = onSnapshot(
+      collection(db, 'users'),
+      (snapshot) => {
+        if (cancelled) return;
+        const remoteList: UserProfile[] = [];
+        snapshot.forEach((docSnap) => {
+          remoteList.push(normalizeUserProfile(docSnap.id, docSnap.data()));
+        });
+        const sorted = dedupeAndSortUsers(remoteList);
 
-      remote.sort((a, b) => {
-        if (isProtectedOwner(a) !== isProtectedOwner(b)) return isProtectedOwner(a) ? -1 : 1;
-        return new Date(b.lastLoginAt || b.lastLogin || b.createdAt).getTime() -
-               new Date(a.lastLoginAt || a.lastLogin || a.createdAt).getTime();
-      });
+        const cacheObj: Record<string, UserProfile> = {};
+        sorted.forEach((user) => {
+          cacheObj[user.uid] = user;
+        });
+        writeStorage(STORAGE_KEYS.USERS, cacheObj);
 
-      const cacheObj: Record<string, UserProfile> = {};
-      remote.forEach(user => {
-        cacheObj[user.uid] = user;
-      });
-      writeStorage(STORAGE_KEYS.USERS, cacheObj);
+        onStatus?.({ loading: false, error: null });
+        callback(sorted);
+      },
+      (err) => {
+        if (cancelled) return;
+        console.warn('Firestore users snapshot warning:', err.message);
+        const friendly = firebaseAuthMessage(
+          err,
+          'Could not load the live users directory from Firestore.'
+        ).message;
+        onStatus?.({ loading: false, error: friendly });
+      }
+    );
+  };
 
-      callback(remote);
-    }, (err) => {
-      console.warn('Firestore users snapshot warning:', err.message);
-      callback([]);
-    });
-  }).catch((err) => console.warn('Could not authorize users list:', err));
+  const hintAuthorized =
+    isCurrentAuthUserPlatformOwner() ||
+    (Boolean(actorUser) &&
+      actorUser!.uid === currentUid &&
+      (actorUser!.role === 'admin' || actorUser!.role === 'master_admin') &&
+      actorUser!.isSuspended !== true);
+
+  if (hintAuthorized) {
+    attachUsersCollectionListener();
+  } else {
+    // Watch the signed-in user's own profile document reactively so even if it is
+    // still being created/updated during sign-in, we attach the admin users listener
+    // immediately once administrative access is confirmed.
+    unsubActorDoc = onSnapshot(
+      doc(db, 'users', currentUid),
+      (actorSnap) => {
+        if (cancelled) return;
+        if (!actorSnap.exists() && !isCurrentAuthUserPlatformOwner()) {
+          return;
+        }
+        const data = actorSnap.exists() ? actorSnap.data() : {};
+        const authorized =
+          isCurrentAuthUserPlatformOwner() ||
+          ((data.role === 'admin' || data.role === 'master_admin') && data.isSuspended !== true);
+        if (authorized) {
+          attachUsersCollectionListener();
+        } else {
+          if (unsubCollection) {
+            unsubCollection();
+            unsubCollection = undefined;
+          }
+          callback([]);
+          onStatus?.({ loading: false, error: null });
+        }
+      },
+      (err) => {
+        if (cancelled) return;
+        console.warn('Could not authorize users list:', err);
+        onStatus?.({
+          loading: false,
+          error: firebaseAuthMessage(err, 'Could not verify administrator permissions for user list.').message
+        });
+      }
+    );
+  }
 
   return () => {
     cancelled = true;
     unsubEvent();
-    unsub?.();
+    unsubActorDoc?.();
+    unsubCollection?.();
   };
 }
 
